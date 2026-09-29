@@ -1,0 +1,555 @@
+:root {
+    --blr-blue: #0078b9;
+    --blr-blue-dark: #005f94;
+    --blr-blue-soft: #eaf6fc;
+    --blr-charcoal: #465055;
+    --blr-text: #25313a;
+    --blr-muted: #6b7280;
+    --blr-bg: #f3f5f6;
+    --blr-card: #ffffff;
+    --blr-border: #e3e7ea;
+    --blr-green: #16a34a;
+    --blr-yellow: #d97706;
+    --blr-shadow: 0 8px 24px rgba(31, 41, 55, 0.08);
+}
+
+html {
+    scroll-behavior: smooth;
+}
+
+body {
+    margin: 0;
+    background: var(--blr-bg);
+    color: var(--blr-text);
+    font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.blr-app-shell {
+    min-height: 100vh;
+    background:
+        radial-gradient(circle at 10% 0%, rgba(0, 120, 185, 0.06), transparent 28%),
+        var(--blr-bg);
+}
+
+.blr-topbar {
+    position: sticky;
+    top: 0;
+    z-index: 1000;
+    background: rgba(255, 255, 255, 0.96);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--blr-border);
+}
+
+.blr-topbar-inner {
+    max-width: 1380px;
+    margin: 0 auto;
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    gap: 18px;
+}
+
+.blr-brand-logo {
+    height: 44px;
+    width: auto;
+    object-fit: contain;
+}
+
+.blr-topbar-title {
+    display: flex;
+    flex-direction: column;
+    font-size: 1rem;
+    color: var(--blr-charcoal);
+    line-height: 1.15;
+}
+
+.blr-topbar-subtitle {
+    margin-top: 3px;
+    font-size: 0.78rem;
+    font-weight: 500;
+    color: var(--blr-muted);
+}
+
+.blr-main {
+    max-width: 1380px;
+    margin: 0 auto;
+    padding: 24px;
+}
+
+/* Hero carousel */
+.blr-hero {
+    position: relative;
+    width: 100%;
+    height: 390px;
+    overflow: hidden;
+    border-radius: 18px;
+    box-shadow: var(--blr-shadow);
+    margin-bottom: 24px;
+    background: #dfe4e7;
+}
+
+#hero-carousel-content,
+.blr-hero-slide {
+    width: 100%;
+    height: 100%;
+}
+
+.blr-hero-slide {
+    position: relative;
+    animation: blrHeroFade 0.75s ease-out;
+}
+
+.blr-hero-image {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    animation: blrKenBurns 12s ease-in-out infinite alternate;
+}
+
+.blr-hero-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    padding: 48px 56px;
+    background: linear-gradient(
+        90deg,
+        rgba(24, 34, 40, 0.82) 0%,
+        rgba(35, 46, 52, 0.58) 43%,
+        rgba(35, 46, 52, 0.10) 76%,
+        rgba(35, 46, 52, 0.02) 100%
+    );
+}
+
+.blr-hero-copy {
+    max-width: 620px;
+}
+
+.blr-hero-title {
+    margin: 0 0 12px 0;
+    color: #fff;
+    font-size: clamp(2.2rem, 4vw, 3.6rem);
+    font-weight: 750;
+    letter-spacing: -0.035em;
+    text-shadow: 0 2px 12px rgba(0, 0, 0, 0.24);
+}
+
+.blr-hero-subtitle {
+    max-width: 600px;
+    margin: 0;
+    color: rgba(255, 255, 255, 0.92);
+    font-size: 1.08rem;
+    line-height: 1.6;
+}
+
+.blr-hero-dots {
+    position: absolute;
+    left: 50%;
+    bottom: 18px;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 8px;
+    z-index: 5;
+}
+
+.blr-hero-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.48);
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.08);
+    transition: all 0.25s ease;
+}
+
+.blr-hero-dot.active {
+    width: 28px;
+    background: #fff;
+}
+
+@keyframes blrHeroFade {
+    from { opacity: 0.35; transform: scale(1.005); }
+    to { opacity: 1; transform: scale(1); }
+}
+
+@keyframes blrKenBurns {
+    from { transform: scale(1.00); }
+    to { transform: scale(1.025); }
+}
+
+/* Main sections */
+.blr-section-card {
+    background: var(--blr-card);
+    border: 1px solid var(--blr-border);
+    border-radius: 16px;
+    padding: 24px;
+    margin-bottom: 20px;
+    box-shadow: 0 4px 14px rgba(31, 41, 55, 0.05);
+}
+
+.blr-section-header {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 22px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid #edf0f2;
+}
+
+.blr-section-header-compact {
+    margin-bottom: 18px;
+}
+
+.blr-step-number {
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
+    display: grid;
+    place-items: center;
+    flex: 0 0 auto;
+    background: var(--blr-blue-soft);
+    color: var(--blr-blue);
+    font-weight: 750;
+    font-size: 0.95rem;
+}
+
+.blr-section-title {
+    margin: 0;
+    color: var(--blr-charcoal);
+    font-size: 1.32rem;
+    font-weight: 720;
+}
+
+.blr-section-copy {
+    margin: 3px 0 0 0;
+    color: var(--blr-muted);
+    font-size: 0.92rem;
+}
+
+.blr-field-label {
+    margin-bottom: 10px;
+    color: var(--blr-charcoal);
+    font-size: 0.9rem;
+    font-weight: 650;
+}
+
+/* Selection pills */
+.blr-pill-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 9px;
+}
+
+.btn.blr-pill {
+    border: 1px solid #d9e0e4 !important;
+    background: #f8fafb !important;
+    color: var(--blr-charcoal) !important;
+    border-radius: 999px !important;
+    padding: 8px 16px !important;
+    font-size: 0.9rem;
+    font-weight: 600;
+    box-shadow: none !important;
+    transition: all 0.18s ease;
+}
+
+.btn.blr-pill:hover {
+    border-color: #9dcfe6 !important;
+    background: #f1f9fd !important;
+    color: var(--blr-blue-dark) !important;
+    transform: translateY(-1px);
+}
+
+.btn.blr-pill.active {
+    background: var(--blr-blue) !important;
+    border-color: var(--blr-blue) !important;
+    color: white !important;
+    box-shadow: 0 4px 12px rgba(0, 120, 185, 0.22) !important;
+}
+
+/* Upload cards */
+.blr-upload-card {
+    display: block;
+    min-height: 132px;
+    border: 2px dashed #cfd7dc;
+    border-radius: 14px;
+    background: #f8fafb;
+    cursor: pointer;
+    transition: all 0.22s ease;
+    overflow: hidden;
+}
+
+.blr-upload-card:hover {
+    border-color: var(--blr-blue);
+    background: #f2f9fd;
+    transform: translateY(-1px);
+}
+
+.blr-upload-card.loaded {
+    border-style: solid;
+    border-color: rgba(22, 163, 74, 0.52);
+    background: rgba(22, 163, 74, 0.035);
+}
+
+.blr-upload-inner {
+    min-height: 128px;
+    padding: 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 18px;
+}
+
+.blr-rgb-icon {
+    width: 52px;
+    height: 52px;
+    display: grid;
+    place-items: center;
+    flex: 0 0 auto;
+    border-radius: 12px;
+    color: #fff;
+    font-size: 0.82rem;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    background: linear-gradient(145deg, #47545a, #2e373c);
+    box-shadow: 0 4px 12px rgba(31,41,55,0.16);
+}
+
+.blr-upload-icon-img {
+    width: 54px;
+    height: 54px;
+    object-fit: contain;
+    flex: 0 0 auto;
+}
+
+.blr-upload-title {
+    color: var(--blr-charcoal);
+    font-size: 1rem;
+    font-weight: 700;
+    margin-bottom: 5px;
+}
+
+.blr-upload-copy {
+    color: var(--blr-muted);
+    font-size: 0.88rem;
+    line-height: 1.4;
+}
+
+.blr-file-status {
+    min-height: 34px;
+    padding-top: 8px;
+}
+
+.blr-loaded-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--blr-charcoal);
+    font-size: 0.86rem;
+}
+
+.blr-loaded-check {
+    width: 22px;
+    height: 22px;
+    display: inline-grid;
+    place-items: center;
+    border-radius: 999px;
+    background: #dcfce7;
+    color: var(--blr-green);
+    font-size: 0.75rem;
+    font-weight: 800;
+}
+
+.blr-loaded-name {
+    max-width: 62%;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    font-weight: 600;
+}
+
+.blr-loaded-label {
+    margin-left: auto;
+    color: var(--blr-green);
+    font-weight: 700;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+/* Buttons */
+.btn-primary,
+.blr-primary-btn {
+    background: var(--blr-blue) !important;
+    border-color: var(--blr-blue) !important;
+}
+
+.btn-primary:hover,
+.blr-primary-btn:hover {
+    background: var(--blr-blue-dark) !important;
+    border-color: var(--blr-blue-dark) !important;
+}
+
+.blr-primary-action-row {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 18px;
+}
+
+.blr-action-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 16px;
+}
+
+.blr-primary-btn,
+.blr-secondary-btn {
+    border-radius: 9px !important;
+    font-weight: 650 !important;
+    padding-left: 18px !important;
+    padding-right: 18px !important;
+}
+
+/* Batch summary returned by existing logic */
+#batch-summary .card {
+    border: 1px solid var(--blr-border) !important;
+    border-radius: 12px !important;
+    overflow: hidden;
+    box-shadow: none !important;
+}
+
+#batch-summary .card-header {
+    background: #f8fafb !important;
+    border-bottom: 1px solid var(--blr-border) !important;
+}
+
+/* Inline preview */
+.blr-inline-preview {
+    margin-top: 18px;
+    border: 1px solid var(--blr-border);
+    border-radius: 14px;
+    background: #fff;
+    overflow: hidden;
+}
+
+.blr-preview-toolbar {
+    min-height: 54px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--blr-border);
+    background: #fbfcfd;
+}
+
+.blr-preview-title {
+    margin: 0;
+    color: var(--blr-charcoal);
+    font-size: 1.05rem;
+    font-weight: 720;
+}
+
+.blr-preview-tools {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.blr-info-btn {
+    width: 28px !important;
+    height: 28px !important;
+    padding: 0 !important;
+    font-weight: 800 !important;
+    color: var(--blr-blue) !important;
+    border-color: var(--blr-blue) !important;
+    background: white !important;
+}
+
+.blr-preview-summary {
+    padding: 7px 12px 5px 12px;
+    border-bottom: 1px solid #f0f2f4;
+}
+
+#preview-graph {
+    background: #000;
+}
+
+.blr-review-bar {
+    padding: 10px 12px;
+    border-top: 1px solid var(--blr-border);
+    background: #fbfcfd;
+}
+
+.blr-review-status {
+    color: var(--blr-muted);
+    font-size: 0.85rem;
+}
+
+/* Export result */
+#generation-status .card,
+#generation-status .alert {
+    border-radius: 12px;
+}
+
+.blr-footer {
+    padding: 22px 6px 8px 6px;
+    color: #9aa2a8;
+    text-align: center;
+    font-size: 0.8rem;
+}
+
+@media (max-width: 900px) {
+    .blr-main {
+        padding: 14px;
+    }
+
+    .blr-topbar-inner {
+        padding: 10px 14px;
+    }
+
+    .blr-brand-logo {
+        height: 36px;
+    }
+
+    .blr-hero {
+        height: 320px;
+        border-radius: 14px;
+    }
+
+    .blr-hero-overlay {
+        padding: 30px 26px;
+    }
+
+    .blr-section-card {
+        padding: 18px;
+        border-radius: 13px;
+    }
+
+    .blr-upload-inner {
+        justify-content: flex-start;
+    }
+}
+
+@media (max-width: 600px) {
+    .blr-topbar-title {
+        display: none;
+    }
+
+    .blr-hero {
+        height: 280px;
+    }
+
+    .blr-hero-title {
+        font-size: 2rem;
+    }
+
+    .blr-hero-subtitle {
+        font-size: 0.94rem;
+    }
+
+    .blr-action-row {
+        align-items: stretch;
+        flex-direction: column;
+    }
+}

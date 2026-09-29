@@ -1,0 +1,8 @@
+dash>=2.17,<4
+dash-bootstrap-components>=1.6,<3
+gunicorn>=22,<24
+numpy>=1.26,<3
+opencv-python-headless>=4.10,<5
+pandas>=2.2,<3
+plotly>=5.24,<7
+xlrd>=2.0.1,<3
