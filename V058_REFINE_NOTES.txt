@@ -1,0 +1,20 @@
+BLRDetector v0.58 - Refine Object
+
+Review workflow:
+1. Open Review Objects.
+2. Click a green or yellow object.
+3. Click Refine Object.
+4. Adjust Brightness threshold (ImageJ baseline = 10).
+   - Lower values retain darker pixels and can reconnect dark bridges.
+   - Higher values remove darker pixels.
+5. Adjust Selection margin.
+   - Negative = shrink local working area.
+   - Positive = expand local working area.
+6. Optional: Auto threshold suggests a local value.
+7. Apply refinement.
+
+Important:
+- Refinement is local; global batch detection settings are unchanged.
+- The red overlay shows selected threshold pixels; the green line shows retained contours.
+- After Apply, the reviewed geometry is authoritative for export and is not globally re-segmented.
+- Add Object remains the tool for missing objects or multiple detections that should become one physical object.
