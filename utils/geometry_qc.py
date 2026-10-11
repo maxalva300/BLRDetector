@@ -2,6 +2,7 @@ import base64
 import csv
 import io
 import math
+import re
 import time
 import zipfile
 
@@ -1303,6 +1304,326 @@ def _manual_localization_mask(
     )
 
 
+
+# ---------------------------------------------------------
+# ImageJ-style local object refinement
+# ---------------------------------------------------------
+
+def _refine_roi_from_bbox(
+    bbox,
+    margin,
+    image_width,
+    image_height,
+):
+    """Build a clipped local ROI around one reviewed object.
+
+    ``margin`` behaves like an ImageJ-style selection adjustment:
+      - positive values expand the working area
+      - negative values shrink it
+    """
+
+    x = int(round(float(bbox["x"])))
+    y = int(round(float(bbox["y"])))
+    w = max(1, int(round(float(bbox["width"]))))
+    h = max(1, int(round(float(bbox["height"]))))
+    margin = int(round(float(margin or 0)))
+
+    # Do not let a negative margin invert the selection.
+    max_shrink = max(0, min(w, h) // 2 - 4)
+    margin = max(-max_shrink, margin)
+
+    x0 = x - margin
+    y0 = y - margin
+    x1 = x + w + margin
+    y1 = y + h + margin
+
+    x0 = max(0, min(image_width - 1, x0))
+    y0 = max(0, min(image_height - 1, y0))
+    x1 = max(x0 + 1, min(image_width, x1))
+    y1 = max(y0 + 1, min(image_height, y1))
+
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        raise ValueError(
+            "The refined selection is too small. Expand the selection area."
+        )
+
+    return x0, y0, x1, y1
+
+
+def _refine_threshold_mask(
+    crop_bgr,
+    threshold,
+    min_island_px=8,
+):
+    """Threshold one local ROI using the validated ImageJ brightness logic.
+
+    This intentionally avoids global morphology. The reviewer controls the
+    threshold and the local selection area directly. Known long dark scanner
+    strips and tiny detached islands are still removed conservatively.
+    """
+
+    threshold = int(round(float(threshold)))
+    threshold = max(1, min(255, threshold))
+
+    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+    brightness = hsv[:, :, 2]
+
+    channel_max = np.max(crop_bgr, axis=2)
+    channel_min = np.min(crop_bgr, axis=2)
+    channel_mean = np.mean(crop_bgr, axis=2)
+    neutral_difference = channel_max - channel_min
+
+    shelf_mask = (
+        (neutral_difference <= 3)
+        & (channel_mean >= 115)
+        & (channel_mean <= 140)
+    )
+
+    keep_mask = (
+        (brightness >= threshold)
+        & (~shelf_mask)
+    )
+
+    # Keep the existing scanner-strip cleanup local to this small ROI.
+    keep_mask, strip_diagnostics = _remove_long_dark_strip_artifacts(
+        crop_bgr=crop_bgr,
+        keep_mask=keep_mask,
+    )
+
+    # Remove only tiny detached islands. Significant disconnected regions are
+    # preserved because the reviewer has already identified one physical item.
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        keep_mask.astype(np.uint8),
+        connectivity=8,
+    )
+
+    cleaned = np.zeros_like(keep_mask, dtype=bool)
+    component_areas = []
+
+    for component_id in range(1, count):
+        area = int(stats[component_id, cv2.CC_STAT_AREA])
+        if area < int(min_island_px):
+            continue
+        cleaned[labels == component_id] = True
+        component_areas.append(area)
+
+    diagnostics = {
+        "threshold": threshold,
+        "selected_pixels": int(np.count_nonzero(cleaned)),
+        "component_count": len(component_areas),
+        "component_areas": component_areas,
+        "strip_diagnostics": strip_diagnostics,
+    }
+
+    return cleaned, diagnostics
+
+
+def suggest_refine_threshold(
+    image_contents,
+    bbox,
+    margin=6,
+):
+    """Suggest a local threshold, favoring one coherent non-flooded region."""
+
+    bgr = _decode_image(image_contents)
+    image_h, image_w = bgr.shape[:2]
+    x0, y0, x1, y1 = _refine_roi_from_bbox(
+        bbox,
+        margin,
+        image_w,
+        image_h,
+    )
+    crop = bgr[y0:y1, x0:x1]
+    crop_area = max(1, crop.shape[0] * crop.shape[1])
+
+    best = None
+    for threshold in [3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 18, 22, 26, 30]:
+        mask, diagnostics = _refine_threshold_mask(crop, threshold)
+        area = diagnostics["selected_pixels"]
+        components = diagnostics["component_count"]
+        if area <= 0:
+            continue
+
+        fill_ratio = area / crop_area
+        flood_penalty = 0.0
+        if fill_ratio > 0.82:
+            flood_penalty += (fill_ratio - 0.82) * 1000.0
+        if fill_ratio < 0.02:
+            flood_penalty += (0.02 - fill_ratio) * 1000.0
+
+        # One connected region is preferred. A lower threshold is allowed to
+        # win when it reconnects a dark bridge that threshold 10 cuts apart.
+        component_penalty = max(0, components - 1) * 100.0
+        baseline_penalty = abs(threshold - 10) * 1.5
+        score = component_penalty + baseline_penalty + flood_penalty
+
+        trial = (score, threshold)
+        if best is None or trial < best:
+            best = trial
+
+    return int(best[1] if best is not None else 10)
+
+
+def build_refine_preview(
+    image_contents,
+    bbox,
+    threshold=10,
+    margin=6,
+):
+    """Build a small ImageJ-style red threshold overlay for one object."""
+
+    bgr = _decode_image(image_contents)
+    image_h, image_w = bgr.shape[:2]
+    x0, y0, x1, y1 = _refine_roi_from_bbox(
+        bbox,
+        margin,
+        image_w,
+        image_h,
+    )
+    crop = bgr[y0:y1, x0:x1]
+    keep_mask, diagnostics = _refine_threshold_mask(crop, threshold)
+
+    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    overlay = rgb.astype(np.float32)
+    if np.any(keep_mask):
+        red = np.zeros_like(overlay)
+        red[:, :, 0] = 255.0
+        overlay[keep_mask] = (
+            overlay[keep_mask] * 0.45
+            + red[keep_mask] * 0.55
+        )
+    overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+
+    # Green edge makes the active selection easy to inspect on dark objects.
+    contours, _ = cv2.findContours(
+        keep_mask.astype(np.uint8) * 255,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+    if contours:
+        cv2.drawContours(overlay_bgr, contours, -1, (0, 255, 0), 1)
+    overlay = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)
+
+    figure = go.Figure(go.Image(z=overlay))
+    figure.update_layout(
+        margin=dict(l=0, r=0, t=0, b=0),
+        showlegend=False,
+        paper_bgcolor="black",
+        plot_bgcolor="black",
+        dragmode=False,
+    )
+    figure.update_xaxes(showticklabels=False, showgrid=False, zeroline=False)
+    figure.update_yaxes(showticklabels=False, showgrid=False, zeroline=False)
+
+    diagnostics.update(
+        {
+            "roi": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
+            "roi_width": x1 - x0,
+            "roi_height": y1 - y0,
+            "margin": int(margin),
+        }
+    )
+
+    return figure, diagnostics
+
+
+def create_refined_object_spec(
+    image_contents,
+    bbox,
+    threshold,
+    margin,
+    manual_id,
+    source_label=None,
+    source_state=None,
+):
+    """Create an authoritative reviewed object from local threshold settings."""
+
+    bgr = _decode_image(image_contents)
+    image_h, image_w = bgr.shape[:2]
+    x0, y0, x1, y1 = _refine_roi_from_bbox(
+        bbox,
+        margin,
+        image_w,
+        image_h,
+    )
+    crop = bgr[y0:y1, x0:x1]
+    local_mask, diagnostics = _refine_threshold_mask(crop, threshold)
+
+    if not np.any(local_mask):
+        raise ValueError(
+            "No object pixels remain at this threshold. Lower the threshold or expand the selection."
+        )
+
+    contours, _ = cv2.findContours(
+        local_mask.astype(np.uint8) * 255,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_NONE,
+    )
+
+    if not contours:
+        raise ValueError("No object contour was found in the refined selection.")
+
+    global_contours = []
+    for contour in contours:
+        if cv2.contourArea(contour) < 1:
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        epsilon = max(1.0, 0.002 * perimeter)
+        simplified = cv2.approxPolyDP(contour, epsilon, True)
+        points = simplified.reshape(-1, 2)
+        global_contours.append(
+            [
+                [int(point[0] + x0), int(point[1] + y0)]
+                for point in points
+            ]
+        )
+
+    if not global_contours:
+        raise ValueError("No usable object contour was found after refinement.")
+
+    nonzero = cv2.findNonZero(local_mask.astype(np.uint8) * 255)
+    if nonzero is None:
+        raise ValueError("No usable refined object was found.")
+
+    bx, by, bw, bh = cv2.boundingRect(nonzero)
+    area = int(np.count_nonzero(local_mask))
+
+    replace_labels = []
+    if source_state != "manual" and source_label is not None:
+        try:
+            replace_labels = [int(source_label)]
+        except (TypeError, ValueError):
+            replace_labels = []
+
+    return {
+        "manual": True,
+        "refined": True,
+        "repair_type": "refined",
+        "manual_id": int(manual_id),
+        "label": -int(manual_id),
+        "source_state": source_state or "green",
+        "source_label": source_label,
+        "replace_labels": replace_labels,
+        "roi": {
+            "x0": int(x0),
+            "y0": int(y0),
+            "x1": int(x1),
+            "y1": int(y1),
+        },
+        "x": int(x0 + bx),
+        "y": int(y0 + by),
+        "width": int(bw),
+        "height": int(bh),
+        "area": area,
+        "geometry_score": 0.0,
+        "manual_contours": global_contours,
+        "local_threshold": int(threshold),
+        "local_close_kernel": 0,
+        "refinement_margin": int(margin),
+        "refinement_components": int(diagnostics["component_count"]),
+    }
+
 def create_manual_object_spec(
     image_contents,
     roi,
@@ -1627,30 +1948,55 @@ def _apply_manual_objects(
             manual_object
         )
 
-        accepted = [
-            candidate
-            for candidate
-            in accepted
-            if (
-                candidate.get(
-                    "manual"
+        replace_labels = {
+            int(label)
+            for label in manual_item.get("replace_labels", [])
+            if label is not None
+        }
+
+        if replace_labels:
+            # Refine Object replaces only the reviewed automatic candidate.
+            # This prevents a slightly expanded local ROI from hiding a
+            # neighboring physical particle.
+            accepted = [
+                candidate
+                for candidate in accepted
+                if (
+                    candidate.get("manual")
+                    or int(candidate.get("label", -999999)) not in replace_labels
                 )
-                or not _candidate_replaced_by_manual(
+            ]
+            suspicious = [
+                candidate
+                for candidate in suspicious
+                if int(candidate.get("label", -999999)) not in replace_labels
+            ]
+        else:
+            # Add Object keeps the original ROI-overlap replacement behavior.
+            accepted = [
+                candidate
+                for candidate
+                in accepted
+                if (
+                    candidate.get(
+                        "manual"
+                    )
+                    or not _candidate_replaced_by_manual(
+                        candidate,
+                        manual_item,
+                    )
+                )
+            ]
+
+            suspicious = [
+                candidate
+                for candidate
+                in suspicious
+                if not _candidate_replaced_by_manual(
                     candidate,
                     manual_item,
                 )
-            )
-        ]
-
-        suspicious = [
-            candidate
-            for candidate
-            in suspicious
-            if not _candidate_replaced_by_manual(
-                candidate,
-                manual_item,
-            )
-        ]
+            ]
 
         accepted.append(
             manual_item
@@ -2098,7 +2444,7 @@ def build_geometry_qc_preview(
     )
 
     # Clickable green objects.
-    # customdata = ["green", component_label, visible_number]
+    # customdata = [state, id, visible_number, x, y, width, height, repair_type]
     figure.add_trace(
         go.Scatter(
             x=[
@@ -2166,6 +2512,17 @@ def build_geometry_qc_preview(
                             "object_number"
                         ]
                     ),
+                    int(candidate["x"]),
+                    int(candidate["y"]),
+                    int(candidate["width"]),
+                    int(candidate["height"]),
+                    str(candidate.get("repair_type", "")),
+                    (
+                        int(candidate.get("source_label"))
+                        if candidate.get("source_label") is not None
+                        else ""
+                    ),
+                    str(candidate.get("source_state", "")),
                 ]
                 for candidate
                 in accepted
@@ -2173,8 +2530,12 @@ def build_geometry_qc_preview(
             hovertext=[
                 (
                     (
-                        f"Added object "
-                        f"{candidate['object_number']}<br>"
+                        (
+                            "Refined object "
+                            if candidate.get("refined")
+                            else "Added object "
+                        )
+                        + f"{candidate['object_number']}<br>"
                         f"{candidate['width']}×"
                         f"{candidate['height']} px<br>"
                         f"Area {candidate['area']}<br>"
@@ -2268,6 +2629,10 @@ def build_geometry_qc_preview(
                                 "suspicious_number"
                             ]
                         ),
+                        int(candidate["x"]),
+                        int(candidate["y"]),
+                        int(candidate["width"]),
+                        int(candidate["height"]),
                     ]
                     for candidate
                     in suspicious
@@ -2344,6 +2709,14 @@ def build_geometry_qc_preview(
 # Final green-set export
 # ---------------------------------------------------------
 
+def _safe_filename_token(value, fallback):
+    """Sanitize user-defined labels before using them in output filenames."""
+    text = (value or "").strip()
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("._-")
+    return text or fallback
+
+
 def generate_green_dataset_zip(
     image_contents,
     metadata_df,
@@ -2352,7 +2725,10 @@ def generate_green_dataset_zip(
     manual_objects,
     condition,
     material,
-    target_size=320,
+    batch_id=None,
+    target_width=320,
+    target_height=320,
+    target_size=None,
     export_brightness=10,
     dark_limit=9,
     qc_cache=None,
@@ -2367,6 +2743,16 @@ def generate_green_dataset_zip(
 
     Final image extraction uses the validated ImageJ-compatible path.
     """
+
+    # Backward compatibility with the previous square-only API.
+    if target_size is not None:
+        target_width = target_size
+        target_height = target_size
+
+    target_width = int(target_width)
+    target_height = int(target_height)
+    if target_width <= 0 or target_height <= 0:
+        raise ValueError("Output width and height must be positive integers.")
 
     base_analysis = _analysis_from_geometry_qc_cache(
         image_contents,
@@ -2412,7 +2798,7 @@ def generate_green_dataset_zip(
             "NT",
     }.get(
         condition,
-        condition,
+        _safe_filename_token(condition, "Condition"),
     )
 
     material_code = {
@@ -2428,7 +2814,12 @@ def generate_green_dataset_zip(
             "Coins",
     }.get(
         material,
-        material,
+        _safe_filename_token(material, "Material"),
+    )
+
+    batch_code = _safe_filename_token(batch_id, "Batch") if batch_id else None
+    filename_prefix = "_".join(
+        part for part in (material_code, condition_code, batch_code) if part
     )
 
     metadata_rows = []
@@ -2533,8 +2924,8 @@ def generate_green_dataset_zip(
                 ]
 
                 if (
-                    width > target_size
-                    or height > target_size
+                    width > target_width
+                    or height > target_height
                 ):
                     skipped += 1
                     continue
@@ -2559,8 +2950,8 @@ def generate_green_dataset_zip(
 
                 canvas = np.zeros(
                     (
-                        target_size,
-                        target_size,
+                        target_height,
+                        target_width,
                         3,
                     ),
                     dtype=np.uint8,
@@ -2574,12 +2965,12 @@ def generate_green_dataset_zip(
                 ]
 
                 paste_x = (
-                    target_size
+                    target_width
                     - width
                 ) // 2
 
                 paste_y = (
-                    target_size
+                    target_height
                     - height
                 ) // 2
 
@@ -2595,8 +2986,7 @@ def generate_green_dataset_zip(
                 ]
 
                 output_filename = (
-                    f"{material_code}_"
-                    f"{condition_code}_"
+                    f"{filename_prefix}_"
                     f"{object_number:03d}.png"
                 )
 
@@ -2624,6 +3014,12 @@ def generate_green_dataset_zip(
                             condition,
                         "material":
                             material,
+                        "batch_id":
+                            batch_id or "",
+                        "output_width_px":
+                            target_width,
+                        "output_height_px":
+                            target_height,
                         "filename":
                             output_filename,
                         "x":
@@ -2654,6 +3050,28 @@ def generate_green_dataset_zip(
                             export_brightness,
                         "dark_limit":
                             dark_limit,
+                        "review_source":
+                            (
+                                "refined"
+                                if candidate.get("refined")
+                                else (
+                                    "manual_add"
+                                    if candidate.get("manual")
+                                    else "automatic"
+                                )
+                            ),
+                        "refinement_threshold":
+                            (
+                                candidate.get("local_threshold", "")
+                                if candidate.get("refined")
+                                else ""
+                            ),
+                        "refinement_margin_px":
+                            (
+                                candidate.get("refinement_margin", "")
+                                if candidate.get("refined")
+                                else ""
+                            ),
                         "status":
                             "exported",
                     }
@@ -2667,6 +3085,9 @@ def generate_green_dataset_zip(
             "object_id",
             "condition",
             "material",
+            "batch_id",
+            "output_width_px",
+            "output_height_px",
             "filename",
             "x",
             "y",
@@ -2677,6 +3098,9 @@ def generate_green_dataset_zip(
             "detection_kernel",
             "export_brightness",
             "dark_limit",
+            "review_source",
+            "refinement_threshold",
+            "refinement_margin_px",
             "status",
         ]
 
@@ -2727,6 +3151,14 @@ def generate_green_dataset_zip(
             qc_diagnostics[
                 "kernel_size"
             ],
+        "batch_id":
+            batch_id or "",
+        "output_width_px":
+            target_width,
+        "output_height_px":
+            target_height,
+        "filename_prefix":
+            filename_prefix,
     }
 
     return (
