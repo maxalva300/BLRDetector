@@ -1,6 +1,8 @@
 import os
 import re
 import base64
+import uuid
+import math
 
 from dash import (
     Dash,
@@ -563,6 +565,26 @@ app.layout = html.Div(
                             ],
                             className="g-4 mt-1",
                         ),
+                        html.Div(
+                            [
+                                html.Div("Brightness threshold", className="blr-field-label"),
+                                dbc.RadioItems(
+                                    id="brightness-mode", value="auto", inline=True,
+                                    options=[{"label": "Auto", "value": "auto"},
+                                             {"label": "Manual", "value": "manual"}],
+                                ),
+                                html.Div(
+                                    dbc.Input(id="batch-brightness", type="number",
+                                              value=10, min=1, max=255, step=1),
+                                    id="batch-brightness-container", style={"display": "none"},
+                                ),
+                                html.Small(
+                                    "Manual applies to batch analysis and export, and starts Refine Object at this value. "
+                                    "Individual refinements override it. After changing settings, click Analyze Batch again.",
+                                    className="text-muted",
+                                ),
+                            ], className="mt-4",
+                        ),
                     ],
                 ),
 
@@ -719,36 +741,49 @@ app.layout = html.Div(
                                             },
                                             style={"display": "none", "width": "100%", "height": "70vh"},
                                         ),
-                                        dbc.Row(
+                                        html.Div(
                                             [
-                                                dbc.Col(
-                                                    html.Div(
-                                                        id="review-selection-status",
-                                                        children="Optional review: click an object only if you want to change its status.",
-                                                        className="blr-review-status",
-                                                    ),
-                                                    md=8,
+                                                html.Div(
+                                                    id="review-selection-status",
+                                                    children="Optional review: click an object only if you want to change its status.",
+                                                    className="blr-review-status",
                                                 ),
-                                                dbc.Col(
-                                                    html.Div([
+                                                html.Div(
+                                                    [
                                                         dbc.Button(
-                                                            "Refine Object",
-                                                            id="refine-object-button",
-                                                            color="primary",
-                                                            outline=True,
-                                                            size="sm",
-                                                            className="me-2",
-                                                            disabled=True,
+                                                            "Refine Object", id="refine-object-button",
+                                                            color="primary", outline=True, size="sm",
+                                                            disabled=True, style={"display": "none"},
+                                                        ),
+                                                        dbc.Button(
+                                                            "Review action", id="review-action-button",
+                                                            color="secondary", disabled=True, size="sm",
                                                             style={"display": "none"},
                                                         ),
-                                                        dbc.Button("Add Object", id="add-object-button", color="primary", outline=True, size="sm", className="me-2"),
-                                                        dbc.Button("Review action", id="review-action-button", color="secondary", disabled=True, size="sm", style={"display": "none"}),
-                                                    ]),
-                                                    md=4,
-                                                    className="text-end",
+                                                    ],
+                                                    style={"display": "flex", "gap": "8px", "justifyContent": "center"},
+                                                ),
+                                                html.Small(
+                                                    "Missing an object? Add an object that was not detected.",
+                                                    className="text-muted border-top pt-3",
+                                                    style={"gridColumn": "1", "alignSelf": "stretch"},
+                                                ),
+                                                html.Div(
+                                                    dbc.Button(
+                                                        "Add Object", id="add-object-button",
+                                                        color="primary", outline=True, size="sm",
+                                                    ),
+                                                    className="border-top pt-3",
+                                                    style={"textAlign": "center", "alignSelf": "stretch"},
                                                 ),
                                             ],
-                                            className="g-2 align-items-center blr-review-bar",
+                                            className="blr-review-bar",
+                                            style={
+                                                "display": "grid",
+                                                "gridTemplateColumns": "minmax(0, 1fr) max-content",
+                                                "alignItems": "center",
+                                                "columnGap": "16px", "rowGap": "16px",
+                                            },
                                         ),
                                     ],
                                 )
@@ -892,6 +927,7 @@ app.layout = html.Div(
                 dcc.Store(id="manual-objects-store", data=[]),
                 dcc.Store(id="add-object-mode-store", data=False),
                 dcc.Store(id="qc-cache-store", data=None),
+                dcc.Store(id="review-viewport-store", data=None),
                 dcc.Store(id="refine-target-store", data=None),
 
                 html.Footer(
@@ -1026,6 +1062,14 @@ def show_metadata_filename(filename):
 # ---------------------------------------------------------
 
 @app.callback(
+    Output("batch-brightness-container", "style"),
+    Input("brightness-mode", "value"),
+)
+def toggle_batch_brightness(mode):
+    return {"display": "block" if mode == "manual" else "none"}
+
+
+@app.callback(
     Output("batch-summary", "children"),
     Output("preview-button-container", "style"),
     Output("generate-button-container", "style"),
@@ -1049,6 +1093,8 @@ def show_metadata_filename(filename):
     State("batch-name-input", "value"),
     State("output-width-input", "value"),
     State("output-height-input", "value"),
+    State("brightness-mode", "value"),
+    State("batch-brightness", "value"),
 
     prevent_initial_call=True,
 )
@@ -1065,6 +1111,8 @@ def analyze_batch(
     batch_name,
     output_width,
     output_height,
+    brightness_mode,
+    batch_brightness,
 ):
     hidden = {"display": "none"}
     visible = {"display": "inline-block"}
@@ -1131,10 +1179,17 @@ def analyze_batch(
         # V0.54: do the expensive 40-setting search ONCE here.
         # The dcc.Store receives only compact JSON-safe parameters/labels,
         # never the image or full-size NumPy label matrices.
+        if brightness_mode not in ("auto", "manual"):
+            raise ValueError("Choose Auto or Manual brightness threshold.")
+        if brightness_mode == "manual" and batch_brightness is None:
+            raise ValueError("Enter a brightness threshold from 1 to 255.")
         qc_cache = prepare_geometry_qc_cache(
             image_contents,
             df,
+            brightness_threshold=batch_brightness if brightness_mode == "manual" else None,
         )
+        # A fresh analysis starts a new view; review edits keep this identity.
+        qc_cache["review_revision"] = uuid.uuid4().hex
 
     except Exception as e:
         return (
@@ -1260,6 +1315,49 @@ def analyze_batch(
 # ---------------------------------------------------------
 # Preview + optional manual review
 # ---------------------------------------------------------
+
+
+def _restore_review_view(figure, viewport, revision):
+    updated = figure.to_dict() if hasattr(figure, "to_dict") else dict(figure)
+    layout = dict(updated.get("layout", {}))
+    if viewport and viewport.get("revision") == revision:
+        for axis in ("xaxis", "yaxis"):
+            if axis in viewport:
+                layout[axis] = dict(layout.get(axis, {}),
+                                    range=list(viewport[axis]), autorange=False)
+    updated["layout"] = layout
+    return updated
+
+
+@app.callback(
+    Output("review-viewport-store", "data"),
+    Input("preview-graph", "relayoutData"),
+    Input("qc-cache-store", "data"),
+    State("review-viewport-store", "data"),
+    prevent_initial_call=True,
+)
+def remember_review_view(data, qc_cache, saved):
+    revision = (qc_cache or {}).get("review_revision", "legacy-review")
+    if ctx.triggered_id == "qc-cache-store":
+        return {"revision": revision}
+    if not data:
+        return no_update
+    viewport = dict(saved or {}) if (saved or {}).get("revision") == revision else {"revision": revision}
+    changed = False
+    for axis in ("xaxis", "yaxis"):
+        if data.get(axis + ".autorange") is True:
+            viewport.pop(axis, None)
+            changed = True
+            continue
+        bounds = data.get(axis + ".range")
+        if bounds is None and axis + ".range[0]" in data and axis + ".range[1]" in data:
+            bounds = [data[axis + ".range[0]"], data[axis + ".range[1]"]]
+        if isinstance(bounds, (list, tuple)) and len(bounds) == 2:
+            if all(isinstance(v, (int, float)) and math.isfinite(v) for v in bounds):
+                viewport[axis] = list(bounds)
+                changed = True
+    return viewport if changed else no_update
+
 
 @app.callback(
     Output(
@@ -1414,6 +1512,7 @@ def analyze_batch(
         "data"
     ),
 
+    State("review-viewport-store", "data"),
     prevent_initial_call=True,
 )
 def review_preview(
@@ -1437,6 +1536,7 @@ def review_preview(
     refine_threshold,
     refine_margin,
     refine_target,
+    review_viewport,
 ):
     triggered = ctx.triggered_id
 
@@ -1550,6 +1650,13 @@ def review_preview(
                 qc_cache,
         )
 
+        # Keep user zoom/pan while rebuilding contours for this analysis.
+        # Axis-only revisions avoid persisting Add Object's drawing mode.
+        revision = (qc_cache or {}).get("review_revision", "legacy-review")
+        figure.update_xaxes(uirevision=revision)
+        figure.update_yaxes(uirevision=revision)
+        figure = _restore_review_view(figure, review_viewport, revision)
+
         summary = (
             _build_preview_summary(
                 scanner_count=
@@ -1578,9 +1685,9 @@ def review_preview(
         figure,
         active,
     ):
-        updated = dict(
-            figure
-            or {}
+        updated = _restore_review_view(
+            figure or {}, review_viewport,
+            (qc_cache or {}).get("review_revision", "legacy-review"),
         )
 
         layout = dict(
@@ -2726,18 +2833,21 @@ def toggle_refine_modal(open_clicks, cancel_clicks, apply_clicks, selected_objec
     Input("refine-reset-button", "n_clicks"),
     State("upload-image", "contents"),
     State("refine-margin-slider", "value"),
+    State("qc-cache-store", "data"),
     prevent_initial_call=True,
 )
-def update_refine_controls(target, auto_clicks, reset_clicks, image_contents, current_margin):
+def update_refine_controls(target, auto_clicks, reset_clicks, image_contents, current_margin, qc_cache):
     triggered = ctx.triggered_id
+    baseline = (qc_cache or {}).get("manual_brightness_threshold")
+    baseline = int(baseline) if baseline is not None else 10
 
     if triggered == "refine-target-store":
         if target:
-            return 10, 6, "ImageJ baseline: brightness threshold 10."
+            return baseline, 6, f"Batch baseline: brightness threshold {baseline}."
         return no_update, no_update, ""
 
     if triggered == "refine-reset-button":
-        return 10, 6, "Reset to threshold 10 and selection margin 6 px."
+        return baseline, 6, f"Reset to threshold {baseline} and selection margin 6 px."
 
     if triggered == "refine-auto-button":
         if not target or not target.get("bbox") or not image_contents:
