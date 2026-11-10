@@ -526,6 +526,7 @@ def analyze_geometry_qc(
     min_area=20,
     max_area=8000,
     geometry_threshold=1.0,
+    brightness_threshold=None,
 ):
     """
     Fast automatic detector + Metadata geometry QC.
@@ -549,7 +550,15 @@ def analyze_geometry_qc(
     metadata_records = extract_metadata_geometry(metadata_df)
     target_count = len(metadata_df)
 
-    brightness_values = [8, 10, 12, 15, 18, 22, 26, 30]
+    if brightness_threshold is not None:
+        value = float(brightness_threshold)
+        if not value.is_integer() or not 1 <= value <= 255:
+            raise ValueError("Brightness threshold must be an integer from 1 to 255.")
+        brightness_threshold = int(value)
+    brightness_values = (
+        [brightness_threshold] if brightness_threshold is not None
+        else [8, 10, 12, 15, 18, 22, 26, 30]
+    )
     kernel_values = [3, 5, 7, 9, 11]
 
     best = None
@@ -667,6 +676,7 @@ def prepare_geometry_qc_cache(
     min_area=20,
     max_area=8000,
     geometry_threshold=1.0,
+    brightness_threshold=None,
 ):
     """
     Run the expensive 40-setting detector search once and return only
@@ -680,6 +690,7 @@ def prepare_geometry_qc_cache(
         min_area=min_area,
         max_area=max_area,
         geometry_threshold=geometry_threshold,
+        brightness_threshold=brightness_threshold,
     )
 
     score_by_label = {}
@@ -690,6 +701,7 @@ def prepare_geometry_qc_cache(
 
     return {
         "version": "0.54",
+        "manual_brightness_threshold": brightness_threshold,
         "brightness_min": int(analysis["diagnostics"]["brightness_min"]),
         "kernel_size": int(analysis["diagnostics"]["kernel_size"]),
         "geometry_threshold": float(geometry_threshold),
@@ -2770,6 +2782,9 @@ def generate_green_dataset_zip(
     target_height = int(target_height)
     if target_width <= 0 or target_height <= 0:
         raise ValueError("Output width and height must be positive integers.")
+
+    if qc_cache and qc_cache.get("manual_brightness_threshold") is not None:
+        export_brightness = int(qc_cache["manual_brightness_threshold"])
 
     base_analysis = _analysis_from_geometry_qc_cache(
         image_contents,
