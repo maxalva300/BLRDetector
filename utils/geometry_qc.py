@@ -2162,7 +2162,9 @@ def _build_manual_repair_export_mask(
     margin=4,
 ):
     """
-    Export geometry for a user-created Add Object repair.
+    Export reviewed geometry for Add Object or Refine Object.
+
+    Refined objects use their local threshold mask, preserving internal holes.
 
     A manual Add Object is an explicit statement from the reviewer that the
     selected region is ONE physical object. Re-running the global
@@ -2189,6 +2191,21 @@ def _build_manual_repair_export_mask(
 
     crop = bgr[y0:y1, x0:x1]
     manual_mask = (detector_labels[y0:y1, x0:x1] == label)
+
+    if candidate.get("refined"):
+        # Reproduce the reviewed local mask, including holes. The exterior
+        # contours are only a preview and cannot represent internal background.
+        roi = candidate["roi"]
+        local_mask, _ = _refine_threshold_mask(
+            bgr[roi["y0"]:roi["y1"], roi["x0"]:roi["x1"]],
+            candidate["local_threshold"],
+        )
+        manual_mask = np.zeros(crop.shape[:2], dtype=bool)
+        ix0, iy0 = max(x0, roi["x0"]), max(y0, roi["y0"])
+        ix1, iy1 = min(x1, roi["x1"]), min(y1, roi["y1"])
+        manual_mask[iy0-y0:iy1-y0, ix0-x0:ix1-x0] = local_mask[
+            iy0-roi["y0"]:iy1-roi["y0"], ix0-roi["x0"]:ix1-roi["x0"]
+        ]
 
     if not np.any(manual_mask):
         return None
