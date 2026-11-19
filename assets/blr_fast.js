@@ -5,7 +5,59 @@
         const t = window.dash_clientside.callback_context.triggered || [];
         return t.length ? t[0].prop_id.split(".")[0] : "";
     }
+    let previewGeneration = 0, rgbSource = null, rgbPromise = null;
+    function loadImage(source) {
+        return new Promise(function (resolve, reject) {
+            const img = new Image();
+            img.onload = function () { resolve(img); };
+            img.onerror = reject;
+            img.src = source;
+        });
+    }
     const api = {
+        downloadPreview: async function (selected, cache, manual, width, height, source, addMode) {
+            const generation = ++previewGeneration;
+            const hidden = [null, "", {display: "none"}];
+            if (!selected || !source || addMode) return hidden;
+            const payload = selected.state === "manual"
+                ? ((manual || []).find(v => Number(v.manual_id) === Number(selected.label)) || {}).reviewed_mask
+                : ((cache || {}).reviewed_masks || {})[String(selected.label)];
+            if (!payload || !payload.area) return hidden;
+            width = Number(width); height = Number(height);
+            if (!Number.isInteger(width) || !Number.isInteger(height) || width < 64 || height < 64 || width > 2048 || height > 2048) return hidden;
+            if (payload.width > width || payload.height > height) return [null, "This object exceeds the output size and will not be exported.", {display: "block"}];
+            // Let the selection controls paint before preparing the small image.
+            await new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
+            if (generation !== previewGeneration) return [nu(), nu(), nu()];
+            try {
+                if (rgbSource !== source) {
+                    rgbSource = source;
+                    rgbPromise = loadImage(source);
+                }
+                const [rgb, mask] = await Promise.all([rgbPromise, loadImage("data:image/png;base64," + payload.png)]);
+                if (generation !== previewGeneration) return [nu(), nu(), nu()];
+                const canvas = document.createElement("canvas");
+                canvas.width = payload.width; canvas.height = payload.height;
+                const ctx = canvas.getContext("2d", {willReadFrequently: true});
+                ctx.drawImage(rgb, payload.x, payload.y, payload.width, payload.height, 0, 0, payload.width, payload.height);
+                const pixels = ctx.getImageData(0, 0, payload.width, payload.height);
+                ctx.clearRect(0, 0, payload.width, payload.height);
+                ctx.drawImage(mask, 0, 0);
+                const selection = ctx.getImageData(0, 0, payload.width, payload.height).data;
+                for (let i = 0; i < pixels.data.length; i += 4) {
+                    if (selection[i] === 0) { pixels.data[i] = 0; pixels.data[i+1] = 0; pixels.data[i+2] = 255; }
+                    pixels.data[i+3] = 255;
+                }
+                const output = document.createElement("canvas"); output.width = width; output.height = height;
+                const out = output.getContext("2d"); out.fillStyle = "rgb(0,0,255)"; out.fillRect(0, 0, width, height);
+                out.putImageData(pixels, Math.floor((width-payload.width)/2), Math.floor((height-payload.height)/2));
+                return [output.toDataURL("image/png"), selected.state === "yellow" ? "Not included unless accepted. Blue areas are excluded." : "Blue areas are excluded from this PNG.", {display: "flex", gap: "24px", alignItems: "center", padding: "16px", flexWrap: "wrap"}];
+            } catch (_) {
+                if (generation !== previewGeneration) return [nu(), nu(), nu()];
+                rgbSource = null; rgbPromise = null;
+                return [null, "Preview unavailable. You can continue reviewing.", {display: "block"}];
+            }
+        },
         selectObject: function (click, addMode) {
             const unchanged = () => Array(6).fill(nu());
             if (addMode || !click || !click.points || !click.points.length) return unchanged();
@@ -18,12 +70,12 @@
             if (c.length >= 8 && c[7]) selected.repair_type = String(c[7]);
             if (c.length >= 9 && c[8] !== "") selected.source_label = Number(c[8]);
             if (c.length >= 10 && c[9]) selected.source_state = String(c[9]);
-            let action = "Exclude", color = "warning", status = "Selected green object " + number + " · green → yellow";
+            let action = "Exclude", color = "warning", status = "Selected green object " + number + " Â· green â†’ yellow";
             if (state === "yellow") {
-                action = "Accept"; color = "success"; status = "Selected S" + number + " · yellow → green";
+                action = "Accept"; color = "success"; status = "Selected S" + number + " Â· yellow â†’ green";
             } else if (state === "manual") {
                 action = "Remove"; color = "danger";
-                status = "Selected " + (selected.repair_type === "refined" ? "refined" : "added") + " object " + number + " · remove repair";
+                status = "Selected " + (selected.repair_type === "refined" ? "refined" : "added") + " object " + number + " Â· remove repair";
             }
             return [selected, false, action, color, {display: "inline-block"}, status];
         },
