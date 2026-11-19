@@ -1,4 +1,5 @@
 import base64
+import os
 import io
 import csv
 import zipfile
@@ -499,7 +500,7 @@ def _contiguous_true_runs(flags):
     return runs
 
 
-def _remove_long_dark_strip_artifacts(
+def _remove_long_dark_strip_artifacts_legacy(
     crop_bgr,
     keep_mask,
     occupancy_min=0.88,
@@ -1008,6 +1009,98 @@ def _remove_long_dark_strip_artifacts(
 
 
 # ---------------------------------------------------------
+def _strip_context_evidence(full_bgr, crop_origin, crop_shape, band, vertical):
+    """Experimental evidence outside the ROI; fixed RGB tests, no user threshold.
+
+    Requires a dark band to continue outside the crop AND differ from both
+    flanks. Missing/ambiguous evidence vetoes deletion, it does not prove metal.
+    """
+    ox, oy = crop_origin
+    ch, cw = crop_shape
+    ih, iw = full_bgr.shape[:2]
+    lo = (ox if vertical else oy) + int(band["x0" if vertical else "y0"])
+    hi = (ox if vertical else oy) + int(band["x1" if vertical else "y1"]) + 1
+    axis_len = iw if vertical else ih
+    lo, hi = max(0, lo), min(axis_len, hi)
+    along_lo, along_hi = (oy, oy + ch) if vertical else (ox, ox + cw)
+    along_len = ih if vertical else iw
+    # Sample both ends, independently of the pixels being reviewed.
+    intervals = [(max(0, along_lo - 64), along_lo),
+                 (along_hi, min(along_len, along_hi + 64))]
+    samples = []
+    for a, b in intervals:
+        if b - a < 16 or hi <= lo:
+            continue
+        left, right = max(0, lo - 8), min(axis_len, hi + 8)
+        if lo - left < 3 or right - hi < 3:
+            continue
+        block = full_bgr[a:b, left:right] if vertical else full_bgr[left:right, a:b].transpose(1, 0, 2)
+        value = block.max(axis=2).astype(float)
+        chroma = value - block.min(axis=2)
+        # A fixed band-pass prevents changing Refine's threshold from
+        # changing this evidence. These values are experimental parameters.
+        signal = (value >= 4) & (value <= 28) & (chroma <= 14)
+        l, h = lo - left, hi - left
+        center = float(signal[:, l:h].mean())
+        flank = max(float(signal[:, :l].mean()), float(signal[:, h:].mean()))
+        contrast = center - flank
+        samples.append({"start": a, "end": b, "support": center,
+                        "contrast": contrast, "supported": center >= 0.65 and contrast >= 0.15})
+    # If both sides are available, require both; a one-sided crop needs
+    # at least 32 pixels of corroborating context.
+    confirmed = bool(samples) and all(v["supported"] for v in samples)
+    if len(samples) == 1:
+        confirmed = confirmed and samples[0]["end"] - samples[0]["start"] >= 32
+    return {"confirmed": bool(confirmed), "samples": samples}
+
+
+def _remove_long_dark_strip_artifacts(crop_bgr, keep_mask, *, full_bgr=None,
+                                      crop_origin=None, **kwargs):
+    """Local experiment: gate legacy deletion with independent RGB context.
+
+    BLR_STRIP_CLEANUP=legacy restores the exact baseline for A/B tests.
+    This deliberately favors retaining pixels when strip evidence is absent.
+    It does not fill holes or classify physical holes versus dark material.
+    """
+    legacy, diagnostics = _remove_long_dark_strip_artifacts_legacy(
+        crop_bgr, keep_mask, **kwargs)
+    if os.environ.get("BLR_STRIP_CLEANUP", "context") == "legacy":
+        return legacy, diagnostics
+    original = keep_mask.astype(bool)
+    allowed = np.zeros(original.shape, dtype=bool)
+    accepted = {"vertical_strips": [], "horizontal_strips": []}
+    evidence = []
+    for key, vertical in (("vertical_strips", True), ("horizontal_strips", False)):
+        for band in diagnostics.get(key, []):
+            e = (_strip_context_evidence(full_bgr, crop_origin, original.shape, band, vertical)
+                 if full_bgr is not None and crop_origin is not None
+                 else {"confirmed": False, "samples": [], "reason": "context unavailable"})
+            evidence.append({"orientation": key, "band": band, **e})
+            if not e["confirmed"]:
+                continue
+            accepted[key].append(band)
+            # Keep the existing halo/residual widths, but only for a band
+            # whose context passed. No new deletion is introduced.
+            expand = int(kwargs.get("residual_halo_expand", 7))
+            axis = "x" if vertical else "y"
+            lo = max(0, int(band.get("halo_" + axis + "0", band[axis + "0"])) - expand)
+            hi = min(original.shape[1 if vertical else 0],
+                     int(band.get("halo_" + axis + "1", band[axis + "1"])) + expand + 1)
+            if vertical:
+                allowed[:, lo:hi] = True
+            else:
+                allowed[lo:hi, :] = True
+    removed = original & ~legacy & allowed
+    cleaned = original & ~removed
+    # Final export cleanup must see only validated bands, never vetoed ones.
+    result = {**accepted, "residual_strip_pixels_removed": 0,
+              "experimental_mode": "context", "context_evidence": evidence,
+              "legacy_removed_pixels": int(np.count_nonzero(original & ~legacy)),
+              "context_removed_pixels": int(removed.sum()),
+              "restored_by_context_veto": int(np.count_nonzero(cleaned & ~legacy))}
+    return cleaned, result
+
+
 # ImageJ-compatible export mask
 # ---------------------------------------------------------
 
@@ -1205,6 +1298,8 @@ def _build_imagej_export_mask(
         _remove_long_dark_strip_artifacts(
             crop_bgr=crop,
             keep_mask=keep_mask,
+            full_bgr=bgr,
+            crop_origin=(x0, y0),
         )
     )
 

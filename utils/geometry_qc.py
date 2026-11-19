@@ -262,6 +262,7 @@ def _segment_prepared(
     kernel_size,
     min_area,
     max_area,
+    area_audit=None,
 ):
     foreground = (
         (brightness >= brightness_min)
@@ -314,6 +315,12 @@ def _segment_prepared(
             continue
 
         if area > max_area:
+            if area_audit is not None:
+                area_audit.append({"label": int(label), "area": area,
+                                   "x": int(stats[label, cv2.CC_STAT_LEFT]),
+                                   "y": int(stats[label, cv2.CC_STAT_TOP]),
+                                   "width": int(stats[label, cv2.CC_STAT_WIDTH]),
+                                   "height": int(stats[label, cv2.CC_STAT_HEIGHT])})
             continue
 
         candidates.append(
@@ -524,7 +531,7 @@ def analyze_geometry_qc(
     image_contents,
     metadata_df,
     min_area=20,
-    max_area=8000,
+    max_area=None,
     geometry_threshold=1.0,
     brightness_threshold=None,
 ):
@@ -548,6 +555,14 @@ def analyze_geometry_qc(
     brightness, shelf_mask = _prepare_image(bgr)
 
     metadata_records = extract_metadata_geometry(metadata_df)
+    metadata_max_area = max(item["area"] for item in metadata_records)
+    # Experimental batch-aware bound, using geometry already read for QC.
+    if max_area is None:
+        max_area = max(8000, int(math.ceil(metadata_max_area * 1.20)))
+    else:
+        max_area = int(max_area)
+    if max_area <= min_area:
+        raise ValueError("Maximum area must exceed minimum area")
     target_count = len(metadata_df)
 
     if brightness_threshold is not None:
@@ -617,6 +632,7 @@ def analyze_geometry_qc(
 
     # Rebuild only the selected setting. This is the only label matrix that
     # survives into preview/export.
+    area_audit = []
     labels, best_candidates = _segment_prepared(
         brightness,
         shelf_mask,
@@ -624,6 +640,7 @@ def analyze_geometry_qc(
         best["kernel_size"],
         min_area,
         max_area,
+        area_audit=area_audit,
     )
 
     best_scores = geometry_compatibility_scores(
@@ -649,6 +666,11 @@ def analyze_geometry_qc(
     elapsed = time.perf_counter() - started
 
     diagnostics = {
+        "max_area": int(max_area),
+        "metadata_max_area": float(metadata_max_area),
+        "metadata_area_margin": 0.20,
+        "area_rejected_candidates": area_audit,
+        "manual_brightness_threshold": brightness_threshold,
         "scanner_count": int(target_count),
         "metadata_geometry_count": int(len(metadata_records)),
         "raw_candidate_count": int(len(best_candidates)),
@@ -670,11 +692,100 @@ def analyze_geometry_qc(
     }
 
 
+def _pack_reviewed_mask(export_data):
+    """Finish all island/residue cleanup before freezing the reviewed mask."""
+    pieces = _split_export_into_single_piece_regions(export_data)
+    if not pieces:
+        raise ValueError("No pixels remain after final cleanup")
+    e = pieces[0]
+    x, y, w, h = [int(e[k]) for k in ("roi_x", "roi_y", "roi_width", "roi_height")]
+    mask = e["keep_mask"][y:y+h, x:x+w]
+    ok, encoded = cv2.imencode(".png", mask.astype(np.uint8) * 255)
+    if not ok:
+        raise ValueError("Could not store reviewed mask")
+    return {"x": int(e["crop_global_x"] + x), "y": int(e["crop_global_y"] + y),
+            "width": w, "height": h, "area": int(mask.sum()),
+            "png": base64.b64encode(encoded.tobytes()).decode("ascii")}
+
+
+def _decode_reviewed_mask(payload):
+    mask = cv2.imdecode(np.frombuffer(base64.b64decode(payload["png"]), np.uint8), cv2.IMREAD_GRAYSCALE)
+    x, y, w, h = [int(payload[k]) for k in ("x", "y", "width", "height")]
+    if mask is None or mask.shape != (h, w):
+        raise ValueError("Invalid reviewed mask")
+    return mask > 0
+
+
+def _export_frozen_mask(bgr, payload):
+    mask = _decode_reviewed_mask(payload)
+    x, y, w, h = [int(payload[k]) for k in ("x", "y", "width", "height")]
+    return dict(crop_bgr=bgr[y:y+h, x:x+w], keep_mask=mask > 0,
+                outer_roi_mask=mask > 0, roi_x=0, roi_y=0, roi_width=w,
+                roi_height=h, crop_global_x=x, crop_global_y=y,
+                global_x=x, global_y=y, strip_diagnostics={})
+
+
+def _prepare_automatic_review_masks(analysis):
+    """ImageJ-style extraction and cleanup, frozen BEFORE review/export.
+
+    Auto retains the historical extraction threshold 10; Manual uses its
+    selected batch threshold. Detection closing is not an export mask.
+    """
+    bgr, labels = analysis["bgr"], analysis["labels"]
+    threshold = analysis["diagnostics"].get("manual_brightness_threshold")
+    threshold = 10 if threshold is None else int(threshold)
+    saved = {}
+    for c in analysis["accepted"] + analysis["suspicious"]:
+        e = _build_imagej_export_mask(bgr, labels, c,
+                                     brightness_min=threshold, dark_limit=threshold - 1)
+        if e is None or not e["keep_mask"].any():
+            w, h = int(c["width"]), int(c["height"])
+            ok, png = cv2.imencode(".png", np.zeros((h, w), np.uint8))
+            if not ok:
+                raise ValueError("Could not store empty final mask")
+            payload = {"x": int(c["x"]), "y": int(c["y"]), "width": w,
+                       "height": h, "area": 0,
+                       "png": base64.b64encode(png.tobytes()).decode("ascii")}
+        else:
+            payload = _pack_reviewed_mask(e)
+        payload["extraction_threshold"] = threshold
+        saved[str(c["label"])] = payload
+    return saved
+
+
+def _apply_reviewed_masks(labels, candidates, saved):
+    for c in candidates:
+        payload = saved.get(str(c["label"]))
+        if payload is None:
+            continue
+        label = int(c["label"])
+        x, y, w, h = [int(c[k]) for k in ("x", "y", "width", "height")]
+        old = labels[y:y+h, x:x+w]
+        old[old == label] = 0
+        reviewed = _decode_reviewed_mask(payload)
+        px, py, pw, ph = [int(payload[k]) for k in ("x", "y", "width", "height")]
+        region = labels[py:py+ph, px:px+pw]
+        region[reviewed] = label
+        c.update({k: int(payload[k]) for k in ("x", "y", "width", "height", "area")})
+        c["reviewed_mask"] = payload
+
+
+def _freeze_manual_spec(bgr, spec):
+    labels = _manual_detector_labels(bgr.shape, spec)
+    e = _build_manual_repair_export_mask(bgr, labels, dict(spec, label=1))
+    if e is None:
+        raise ValueError("No reviewed pixels remain")
+    payload = _pack_reviewed_mask(e)
+    spec = dict(spec, reviewed_mask=payload)
+    spec.update({k: int(payload[k]) for k in ("x", "y", "width", "height", "area")})
+    return spec
+
+
 def prepare_geometry_qc_cache(
     image_contents,
     metadata_df,
     min_area=20,
-    max_area=8000,
+    max_area=None,
     geometry_threshold=1.0,
     brightness_threshold=None,
 ):
@@ -693,6 +804,20 @@ def prepare_geometry_qc_cache(
         brightness_threshold=brightness_threshold,
     )
 
+    max_area = int(analysis["diagnostics"]["max_area"])
+    analysis["diagnostics"]["local_threshold_experiment"] = {"enabled": False}
+    reviewed_masks = _prepare_automatic_review_masks(analysis)
+    # Empty final selections stay visible as suspicious, never silently
+    # accepted as an object that cannot be exported.
+    empty = {int(k) for k, v in reviewed_masks.items() if v["area"] == 0}
+    if empty:
+        moved = [c for c in analysis["accepted"] if int(c["label"]) in empty]
+        analysis["accepted"] = [c for c in analysis["accepted"] if int(c["label"]) not in empty]
+        analysis["suspicious"].extend(moved)
+        analysis["suspicious"].sort(key=lambda c: (c["y"], c["x"]))
+        analysis["diagnostics"]["automatic_accepted_count"] = len(analysis["accepted"])
+        analysis["diagnostics"]["automatic_suspicious_count"] = len(analysis["suspicious"])
+
     score_by_label = {}
     for candidate in analysis["accepted"] + analysis["suspicious"]:
         score_by_label[str(int(candidate["label"]))] = float(
@@ -701,6 +826,7 @@ def prepare_geometry_qc_cache(
 
     return {
         "version": "0.54",
+        "reviewed_masks": reviewed_masks,
         "manual_brightness_threshold": brightness_threshold,
         "brightness_min": int(analysis["diagnostics"]["brightness_min"]),
         "kernel_size": int(analysis["diagnostics"]["kernel_size"]),
@@ -728,7 +854,10 @@ def _analysis_from_geometry_qc_cache(
     This replaces the 40-setting search during Review and Generate.
     """
     if not qc_cache:
-        return analyze_geometry_qc(image_contents, metadata_df)
+        analysis = analyze_geometry_qc(image_contents, metadata_df)
+        saved = _prepare_automatic_review_masks(analysis)
+        _apply_reviewed_masks(analysis["labels"], analysis["accepted"] + analysis["suspicious"], saved)
+        return analysis
 
     started = time.perf_counter()
 
@@ -743,6 +872,8 @@ def _analysis_from_geometry_qc_cache(
         int(qc_cache.get("min_area", 20)),
         int(qc_cache.get("max_area", 8000)),
     )
+
+    _apply_reviewed_masks(labels, candidates, qc_cache.get("reviewed_masks", {}))
 
     accepted_labels = {
         int(value) for value in qc_cache.get("accepted_labels", [])
@@ -1366,6 +1497,8 @@ def _refine_threshold_mask(
     crop_bgr,
     threshold,
     min_island_px=8,
+    full_bgr=None,
+    crop_origin=None,
 ):
     """Threshold one local ROI using the validated ImageJ brightness logic.
 
@@ -1400,6 +1533,8 @@ def _refine_threshold_mask(
     keep_mask, strip_diagnostics = _remove_long_dark_strip_artifacts(
         crop_bgr=crop_bgr,
         keep_mask=keep_mask,
+        full_bgr=full_bgr,
+        crop_origin=crop_origin,
     )
 
     # Remove only tiny detached islands. Significant disconnected regions are
@@ -1418,6 +1553,21 @@ def _refine_threshold_mask(
             continue
         cleaned[labels == component_id] = True
         component_areas.append(area)
+
+    if cleaned.any():
+        points = cv2.findNonZero(cleaned.astype(np.uint8))
+        rx, ry, rw, rh = cv2.boundingRect(points)
+        e = dict(crop_bgr=crop_bgr, keep_mask=cleaned, outer_roi_mask=cleaned,
+                 roi_x=rx, roi_y=ry, roi_width=rw, roi_height=rh,
+                 crop_global_x=0, crop_global_y=0, global_x=rx, global_y=ry,
+                 strip_diagnostics={})
+        payload = _pack_reviewed_mask(e)
+        frozen = _export_frozen_mask(crop_bgr, payload)
+        cleaned = np.zeros(cleaned.shape, bool)
+        fx, fy = payload["x"], payload["y"]
+        cleaned[fy:fy+payload["height"], fx:fx+payload["width"]] = frozen["keep_mask"]
+        count, _, stats, _ = cv2.connectedComponentsWithStats(cleaned.astype(np.uint8), 8)
+        component_areas = [int(stats[i, cv2.CC_STAT_AREA]) for i in range(1, count)]
 
     diagnostics = {
         "threshold": threshold,
@@ -1450,7 +1600,7 @@ def suggest_refine_threshold(
 
     best = None
     for threshold in [3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 18, 22, 26, 30]:
-        mask, diagnostics = _refine_threshold_mask(crop, threshold)
+        mask, diagnostics = _refine_threshold_mask(crop, threshold, full_bgr=bgr, crop_origin=(x0, y0))
         area = diagnostics["selected_pixels"]
         components = diagnostics["component_count"]
         if area <= 0:
@@ -1493,7 +1643,7 @@ def build_refine_preview(
         image_h,
     )
     crop = bgr[y0:y1, x0:x1]
-    keep_mask, diagnostics = _refine_threshold_mask(crop, threshold)
+    keep_mask, diagnostics = _refine_threshold_mask(crop, threshold, full_bgr=bgr, crop_origin=(x0, y0))
 
     rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
     overlay = rgb.astype(np.float32)
@@ -1517,7 +1667,9 @@ def build_refine_preview(
         cv2.drawContours(overlay_bgr, contours, -1, (0, 255, 0), 1)
     overlay = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)
 
-    figure = go.Figure(go.Image(z=overlay))
+    final_rgb = np.full_like(rgb, [0, 0, 255])
+    final_rgb[keep_mask] = rgb[keep_mask]
+    figure = go.Figure(go.Image(z=final_rgb))
     figure.update_layout(
         margin=dict(l=0, r=0, t=0, b=0),
         showlegend=False,
@@ -1540,7 +1692,7 @@ def build_refine_preview(
     return figure, diagnostics
 
 
-def create_refined_object_spec(
+def _create_refined_object_spec_unfrozen(
     image_contents,
     bbox,
     threshold,
@@ -1560,7 +1712,7 @@ def create_refined_object_spec(
         image_h,
     )
     crop = bgr[y0:y1, x0:x1]
-    local_mask, diagnostics = _refine_threshold_mask(crop, threshold)
+    local_mask, diagnostics = _refine_threshold_mask(crop, threshold, full_bgr=bgr, crop_origin=(x0, y0))
 
     if not np.any(local_mask):
         raise ValueError(
@@ -1636,7 +1788,7 @@ def create_refined_object_spec(
         "refinement_components": int(diagnostics["component_count"]),
     }
 
-def create_manual_object_spec(
+def _create_manual_object_spec_unfrozen(
     image_contents,
     roi,
     manual_id,
@@ -1792,6 +1944,18 @@ def create_manual_object_spec(
                 close_kernel_size
             ),
     }
+
+
+def create_refined_object_spec(image_contents, bbox, threshold, margin, manual_id,
+                               source_label=None, source_state=None):
+    spec = _create_refined_object_spec_unfrozen(image_contents, bbox, threshold, margin,
+                                               manual_id, source_label, source_state)
+    return _freeze_manual_spec(_decode_image(image_contents), spec)
+
+
+def create_manual_object_spec(image_contents, roi, manual_id):
+    spec = _create_manual_object_spec_unfrozen(image_contents, roi, manual_id)
+    return _freeze_manual_spec(_decode_image(image_contents), spec)
 
 
 def _candidate_replaced_by_manual(
@@ -2129,6 +2293,13 @@ def _manual_detector_labels(
         dtype=np.int32,
     )
 
+    if manual_candidate.get("reviewed_mask"):
+        payload = manual_candidate["reviewed_mask"]
+        reviewed = _decode_reviewed_mask(payload)
+        x, y, w, h = [int(payload[k]) for k in ("x", "y", "width", "height")]
+        labels[y:y+h, x:x+w][reviewed] = 1
+        return labels
+
     contours = []
 
     for contour_points in manual_candidate.get(
@@ -2189,6 +2360,9 @@ def _build_manual_repair_export_mask(
     while avoiding a large artificial black fill where possible.
     """
 
+    if candidate.get("reviewed_mask"):
+        return _export_frozen_mask(bgr, candidate["reviewed_mask"])
+
     image_h, image_w = bgr.shape[:2]
     x = int(candidate["x"])
     y = int(candidate["y"])
@@ -2211,6 +2385,8 @@ def _build_manual_repair_export_mask(
         local_mask, _ = _refine_threshold_mask(
             bgr[roi["y0"]:roi["y1"], roi["x0"]:roi["x1"]],
             candidate["local_threshold"],
+            full_bgr=bgr,
+            crop_origin=(roi["x0"], roi["y0"]),
         )
         manual_mask = np.zeros(crop.shape[:2], dtype=bool)
         ix0, iy0 = max(x0, roi["x0"]), max(y0, roi["y0"])
@@ -2288,11 +2464,18 @@ def _candidate_contours(
     image_h, image_w = labels.shape[:2]
 
     for candidate in candidates:
-        if candidate.get("manual"):
+        if candidate.get("manual") or candidate.get("reviewed_mask"):
             contours = []
             contour_offsets = []
 
-            for contour_points in candidate.get("manual_contours", []):
+            payload = candidate.get("reviewed_mask")
+            if payload:
+                reviewed = _decode_reviewed_mask(payload)
+                cs, _ = cv2.findContours(reviewed.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                contours.extend(cs)
+                contour_offsets.extend([(payload["x"], payload["y"])] * len(cs))
+
+            for contour_points in ([] if payload else candidate.get("manual_contours", [])):
                 if len(contour_points) < 2:
                     continue
 
@@ -2315,13 +2498,6 @@ def _candidate_contours(
             local_mask = (
                 labels[y0:y1, x0:x1] == int(candidate["label"])
             )
-
-            if bgr is not None and np.any(local_mask):
-                local_bgr = bgr[y0:y1, x0:x1]
-                local_mask, _ = _remove_long_dark_strip_artifacts(
-                    crop_bgr=local_bgr,
-                    keep_mask=local_mask,
-                )
 
             component_mask = local_mask.astype(np.uint8) * 255
 
@@ -2361,6 +2537,9 @@ def build_geometry_qc_preview(
     manual_excluded_labels=None,
     manual_objects=None,
     qc_cache=None,
+    show_export_mask=False,
+    output_width=320,
+    output_height=320,
 ):
     """
     Green = included in download.
@@ -2441,9 +2620,27 @@ def build_geometry_qc_preview(
 
     figure = go.Figure()
 
+    preview_source = image_contents
+    if show_export_mask:
+        canvas = np.full_like(bgr, [255, 0, 0])
+        for c in accepted:
+            e = (_build_manual_repair_export_mask(bgr, _manual_detector_labels(bgr.shape, c), dict(c, label=1))
+                 if c.get("manual") else _build_analysis_mask_export(bgr, labels, c))
+            if e is None:
+                continue
+            if e["roi_width"] > int(output_width) or e["roi_height"] > int(output_height):
+                continue
+            x, y = e["crop_global_x"], e["crop_global_y"]
+            h, w = e["keep_mask"].shape
+            canvas[y:y+h, x:x+w][e["keep_mask"]] = e["crop_bgr"][e["keep_mask"]]
+        ok, encoded = cv2.imencode(".png", canvas)
+        if not ok:
+            raise ValueError("Could not render export mask")
+        preview_source = "data:image/png;base64," + base64.b64encode(encoded.tobytes()).decode("ascii")
+
     figure.add_layout_image(
         dict(
-            source=image_contents,
+            source=preview_source,
             xref="x",
             yref="y",
             x=0,
@@ -2746,6 +2943,26 @@ def _safe_filename_token(value, fallback):
     return text or fallback
 
 
+def _build_analysis_mask_export(bgr, labels, candidate):
+    """Scenario 2: copy the analysis label verbatim, including morphology.
+
+    No brightness reconstruction, dark-hole filter, strip cleanup or final
+    island cleanup. Zero RGB values inside the label are deliberately copied.
+    """
+    if candidate.get("reviewed_mask"):
+        return _export_frozen_mask(bgr, candidate["reviewed_mask"])
+    x, y = int(candidate["x"]), int(candidate["y"])
+    w, h = int(candidate["width"]), int(candidate["height"])
+    crop = bgr[y:y+h, x:x+w]
+    mask = labels[y:y+h, x:x+w] == int(candidate["label"])
+    if not mask.any():
+        return None
+    return dict(crop_bgr=crop, keep_mask=mask, outer_roi_mask=mask,
+                roi_x=0, roi_y=0, roi_width=w, roi_height=h,
+                crop_global_x=x, crop_global_y=y, global_x=x, global_y=y,
+                strip_diagnostics={})
+
+
 def generate_green_dataset_zip(
     image_contents,
     metadata_df,
@@ -2903,36 +3120,16 @@ def generate_green_dataset_zip(
                     candidate=current_candidate,
                 )
             else:
-                export_data = (
-                    _build_imagej_export_mask(
-                        bgr=bgr,
-                        detector_labels=
-                            current_detector_labels,
-                        candidate=
-                            current_candidate,
-                        brightness_min=
-                            export_brightness,
-                        dark_limit=
-                            dark_limit,
-                    )
+                export_data = _build_analysis_mask_export(
+                    bgr, detector_labels, candidate,
                 )
 
             if export_data is None:
                 skipped += 1
                 continue
 
-            # Final single-piece rule:
-            # - tiny disconnected fragments are discarded
-            # - a similarly sized second component is exported separately
-            # - every PNG therefore contains one retained component
-            piece_exports = (
-                _split_export_into_single_piece_regions(
-                    export_data,
-                    small_fragment_ratio=0.10,
-                    split_fragment_ratio=0.35,
-                    min_fragment_area_px=12,
-                )
-            )
+            # All cleanup was applied before the mask was displayed/stored.
+            piece_exports = [export_data]
 
             if not piece_exports:
                 skipped += 1
@@ -3079,9 +3276,12 @@ def generate_green_dataset_zip(
                                 "kernel_size"
                             ],
                         "export_brightness":
-                            export_brightness,
+                            (export_brightness if candidate.get("manual")
+                             else candidate.get("reviewed_mask", {}).get("extraction_threshold", 10)),
+                        "export_mask_source":
+                            ("reviewed_local" if candidate.get("manual") else "reviewed_imagej_extraction"),
                         "dark_limit":
-                            dark_limit,
+                            ("" if candidate.get("manual") else candidate.get("reviewed_mask", {}).get("extraction_threshold", 10) - 1),
                         "review_source":
                             (
                                 "refined"
@@ -3129,6 +3329,7 @@ def generate_green_dataset_zip(
             "detection_brightness",
             "detection_kernel",
             "export_brightness",
+            "export_mask_source",
             "dark_limit",
             "review_source",
             "refinement_threshold",
@@ -3197,3 +3398,40 @@ def generate_green_dataset_zip(
         zip_buffer.getvalue(),
         diagnostics,
     )
+
+
+def build_selected_download_preview(image_contents, selected, qc_cache,
+                                    manual_objects=None, output_width=320,
+                                    output_height=320):
+    """Render the saved selection using the exact export canvas placement."""
+    if not selected:
+        return None, ""
+    state, label = selected.get("state"), int(selected["label"])
+    if state == "manual":
+        item = next((v for v in (manual_objects or [])
+                     if int(v.get("manual_id", -1)) == label), None)
+        payload = (item or {}).get("reviewed_mask")
+    else:
+        payload = (qc_cache or {}).get("reviewed_masks", {}).get(str(label))
+    if payload is None:
+        return None, "Run Analyze Batch again to create this preview."
+    width, height = int(output_width), int(output_height)
+    if not (64 <= width <= 2048 and 64 <= height <= 2048):
+        return None, "Choose a valid output image size."
+    if payload["area"] == 0:
+        return None, "No selected pixels remain for this object."
+    if payload["width"] > width or payload["height"] > height:
+        return None, "This object exceeds the output size and will not be exported."
+    bgr = _decode_image(image_contents)
+    e = _export_frozen_mask(bgr, payload)
+    h, w = e["keep_mask"].shape
+    canvas = np.full((height, width, 3), [255, 0, 0], np.uint8)
+    px, py = (width - w) // 2, (height - h) // 2
+    region = canvas[py:py+h, px:px+w]
+    region[e["keep_mask"]] = e["crop_bgr"][e["keep_mask"]]
+    ok, encoded = cv2.imencode(".png", canvas)
+    if not ok:
+        raise ValueError("Could not render download preview")
+    note = ("Not included in the dataset unless accepted."
+            if state == "yellow" else "Blue areas are excluded from this PNG.")
+    return "data:image/png;base64," + base64.b64encode(encoded.tobytes()).decode("ascii"), note
