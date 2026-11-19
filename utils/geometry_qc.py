@@ -827,6 +827,7 @@ def prepare_geometry_qc_cache(
     return {
         "version": "0.54",
         "reviewed_masks": reviewed_masks,
+        "candidate_specs": [dict(c) for c in analysis["accepted"] + analysis["suspicious"]],
         "manual_brightness_threshold": brightness_threshold,
         "brightness_min": int(analysis["diagnostics"]["brightness_min"]),
         "kernel_size": int(analysis["diagnostics"]["kernel_size"]),
@@ -862,17 +863,22 @@ def _analysis_from_geometry_qc_cache(
     started = time.perf_counter()
 
     bgr = _decode_image(image_contents)
-    brightness, shelf_mask = _prepare_image(bgr)
-
-    labels, candidates = _segment_prepared(
-        brightness,
-        shelf_mask,
-        int(qc_cache.get("brightness_min", 12)),
-        int(qc_cache.get("kernel_size", 5)),
-        int(qc_cache.get("min_area", 20)),
-        int(qc_cache.get("max_area", 8000)),
-    )
-
+    specs = qc_cache.get("candidate_specs")
+    if specs is not None and qc_cache.get("reviewed_masks"):
+        # Final masks are already cached: no HSV/morphology or relabeling.
+        labels = np.zeros(bgr.shape[:2], dtype=np.int32)
+        candidates = [dict(c) for c in specs]
+    else:
+        brightness, shelf_mask = _prepare_image(bgr)
+    
+        labels, candidates = _segment_prepared(
+            brightness,
+            shelf_mask,
+            int(qc_cache.get("brightness_min", 12)),
+            int(qc_cache.get("kernel_size", 5)),
+            int(qc_cache.get("min_area", 20)),
+            int(qc_cache.get("max_area", 8000)),
+        )
     _apply_reviewed_masks(labels, candidates, qc_cache.get("reviewed_masks", {}))
 
     accepted_labels = {
@@ -1667,9 +1673,13 @@ def build_refine_preview(
         cv2.drawContours(overlay_bgr, contours, -1, (0, 255, 0), 1)
     overlay = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)
 
-    final_rgb = np.full_like(rgb, [0, 0, 255])
-    final_rgb[keep_mask] = rgb[keep_mask]
-    figure = go.Figure(go.Image(z=final_rgb))
+    # Restore the familiar red overlay; the underlying keep_mask is unchanged.
+    # PNG transport avoids serializing one JSON number for every RGB channel.
+    ok, encoded = cv2.imencode(".png", cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+    if not ok:
+        raise ValueError("Could not render Refine preview")
+    source = "data:image/png;base64," + base64.b64encode(encoded.tobytes()).decode("ascii")
+    figure = go.Figure(go.Image(source=source))
     figure.update_layout(
         margin=dict(l=0, r=0, t=0, b=0),
         showlegend=False,

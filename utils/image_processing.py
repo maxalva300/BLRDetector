@@ -605,21 +605,16 @@ def _remove_long_dark_strip_artifacts_legacy(
         dtype=np.float32,
     )
 
-    for column in range(bw):
-        column_mask = local_mask[:, column]
-
-        column_occupancy[column] = (
-            np.count_nonzero(column_mask)
-            / float(bh)
-        )
-
-        if np.any(column_mask):
-            column_median_brightness[column] = np.median(
-                local_brightness[:, column][column_mask]
-            )
-            column_median_chroma[column] = np.median(
-                local_chroma[:, column][column_mask]
-            )
+    column_occupancy[:] = (
+        np.count_nonzero(local_mask, axis=0) / float(bh)
+    ).astype(np.float32)
+    # Without a possible core, no strip can be detected in this direction.
+    # Otherwise only core/fringe-eligible rows or columns need medians.
+    if np.any(column_occupancy >= occupancy_min):
+        for column in np.flatnonzero(column_occupancy >= min(occupancy_min, fringe_occupancy_min)):
+            column_mask = local_mask[:, column]
+            column_median_brightness[column] = np.median(local_brightness[:, column][column_mask])
+            column_median_chroma[column] = np.median(local_chroma[:, column][column_mask])
 
     vertical_core = (
         (column_occupancy >= occupancy_min)
@@ -800,21 +795,16 @@ def _remove_long_dark_strip_artifacts_legacy(
         dtype=np.float32,
     )
 
-    for row in range(bh):
-        row_mask = local_mask[row, :]
-
-        row_occupancy[row] = (
-            np.count_nonzero(row_mask)
-            / float(bw)
-        )
-
-        if np.any(row_mask):
-            row_median_brightness[row] = np.median(
-                local_brightness[row, :][row_mask]
-            )
-            row_median_chroma[row] = np.median(
-                local_chroma[row, :][row_mask]
-            )
+    row_occupancy[:] = (
+        np.count_nonzero(local_mask, axis=1) / float(bw)
+    ).astype(np.float32)
+    # Without a possible core, no strip can be detected in this direction.
+    # Otherwise only core/fringe-eligible rows or columns need medians.
+    if np.any(row_occupancy >= occupancy_min):
+        for row in np.flatnonzero(row_occupancy >= min(occupancy_min, fringe_occupancy_min)):
+            row_mask = local_mask[row, :]
+            row_median_brightness[row] = np.median(local_brightness[row, :][row_mask])
+            row_median_chroma[row] = np.median(local_chroma[row, :][row_mask])
 
     horizontal_core = (
         (row_occupancy >= occupancy_min)
