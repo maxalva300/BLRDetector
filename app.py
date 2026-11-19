@@ -787,6 +787,10 @@ app.layout = html.Div(
                                                 "columnGap": "16px", "rowGap": "16px",
                                             },
                                         ),
+                                        html.Div([
+                                            html.Img(id="browser-download-image", style={"width": "240px", "maxWidth": "100%", "imageRendering": "pixelated"}),
+                                            html.Div([html.Strong("Download preview"), html.Div(id="browser-download-note")]),
+                                        ], id="browser-download-preview", style={"display": "none"}),
                                     ],
                                 )
                             ],
@@ -1350,6 +1354,21 @@ app.clientside_callback(
     Input("review-figure-store", "data"),
     State("upload-image", "contents"),
     State("review-viewport-store", "data"),
+    prevent_initial_call=True,
+)
+
+app.clientside_callback(
+    ClientsideFunction(namespace="blr_fast", function_name="downloadPreview"),
+    Output("browser-download-image", "src"),
+    Output("browser-download-note", "children"),
+    Output("browser-download-preview", "style"),
+    Input("selected-object-store", "data"),
+    Input("qc-cache-store", "data"),
+    Input("manual-objects-store", "data"),
+    Input("output-width-input", "value"),
+    Input("output-height-input", "value"),
+    Input("upload-image", "contents"),
+    Input("add-object-mode-store", "data"),
     prevent_initial_call=True,
 )
 
