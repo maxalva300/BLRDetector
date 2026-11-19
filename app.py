@@ -13,6 +13,8 @@ from dash import (
     State,
     ctx,
     no_update,
+    Patch,
+    ClientsideFunction,
 )
 import dash_bootstrap_components as dbc
 
@@ -797,7 +799,7 @@ app.layout = html.Div(
                                 dbc.ModalBody(
                                     [
                                         html.P(
-                                            "Blue pixels are excluded. The preview shows the cleaned mask that Apply will save. "
+                                            "Red marks the cleaned selection that Apply will save. "
                                             "Negative selection margin shrinks the working area; positive values expand it.",
                                             className="text-muted mb-3",
                                         ),
@@ -928,6 +930,8 @@ app.layout = html.Div(
                 dcc.Store(id="add-object-mode-store", data=False),
                 dcc.Store(id="qc-cache-store", data=None),
                 dcc.Store(id="review-viewport-store", data=None),
+                dcc.Store(id="review-drawing-store", data=None),
+                dcc.Store(id="review-figure-store", data=None),
                 dcc.Store(id="refine-target-store", data=None),
 
                 html.Footer(
@@ -1329,35 +1333,38 @@ def _restore_review_view(figure, viewport, revision):
     return updated
 
 
-@app.callback(
+app.clientside_callback(
+    ClientsideFunction(namespace="blr_fast", function_name="rememberView"),
     Output("review-viewport-store", "data"),
+    Output("review-drawing-store", "data"),
     Input("preview-graph", "relayoutData"),
     Input("qc-cache-store", "data"),
+    State("add-object-mode-store", "data"),
     State("review-viewport-store", "data"),
     prevent_initial_call=True,
 )
-def remember_review_view(data, qc_cache, saved):
-    revision = (qc_cache or {}).get("review_revision", "legacy-review")
-    if ctx.triggered_id == "qc-cache-store":
-        return {"revision": revision}
-    if not data:
-        return no_update
-    viewport = dict(saved or {}) if (saved or {}).get("revision") == revision else {"revision": revision}
-    changed = False
-    for axis in ("xaxis", "yaxis"):
-        if data.get(axis + ".autorange") is True:
-            viewport.pop(axis, None)
-            changed = True
-            continue
-        bounds = data.get(axis + ".range")
-        if bounds is None and axis + ".range[0]" in data and axis + ".range[1]" in data:
-            bounds = [data[axis + ".range[0]"], data[axis + ".range[1]"]]
-        if isinstance(bounds, (list, tuple)) and len(bounds) == 2:
-            if all(isinstance(v, (int, float)) and math.isfinite(v) for v in bounds):
-                viewport[axis] = list(bounds)
-                changed = True
-    return viewport if changed else no_update
 
+app.clientside_callback(
+    ClientsideFunction(namespace="blr_fast", function_name="attachImage"),
+    Output("preview-graph", "figure"),
+    Input("review-figure-store", "data"),
+    State("upload-image", "contents"),
+    State("review-viewport-store", "data"),
+    prevent_initial_call=True,
+)
+
+app.clientside_callback(
+    ClientsideFunction(namespace="blr_fast", function_name="selectObject"),
+    Output("selected-object-store", "data", allow_duplicate=True),
+    Output("review-action-button", "disabled", allow_duplicate=True),
+    Output("review-action-button", "children", allow_duplicate=True),
+    Output("review-action-button", "color", allow_duplicate=True),
+    Output("review-action-button", "style", allow_duplicate=True),
+    Output("review-selection-status", "children", allow_duplicate=True),
+    Input("preview-graph", "clickData"),
+    State("add-object-mode-store", "data"),
+    prevent_initial_call=True,
+)
 
 @app.callback(
     Output(
@@ -1369,8 +1376,8 @@ def remember_review_view(data, qc_cache, saved):
         "children"
     ),
     Output(
-        "preview-graph",
-        "figure"
+        "review-figure-store",
+        "data"
     ),
     Output(
         "preview-graph",
@@ -1439,12 +1446,8 @@ def remember_review_view(data, qc_cache, saved):
         "n_clicks"
     ),
     Input(
-        "preview-graph",
-        "clickData"
-    ),
-    Input(
-        "preview-graph",
-        "relayoutData"
+        "review-drawing-store",
+        "data"
     ),
     Input(
         "review-action-button",
@@ -1492,10 +1495,6 @@ def remember_review_view(data, qc_cache, saved):
         "data"
     ),
     State(
-        "preview-graph",
-        "figure"
-    ),
-    State(
         "qc-cache-store",
         "data"
     ),
@@ -1518,7 +1517,6 @@ def remember_review_view(data, qc_cache, saved):
 def review_preview(
     preview_clicks,
     close_clicks,
-    click_data,
     relayout_data,
     action_clicks,
     add_clicks,
@@ -1531,7 +1529,6 @@ def review_preview(
     selected_object,
     manual_objects,
     add_object_mode,
-    current_figure,
     qc_cache,
     refine_threshold,
     refine_margin,
@@ -1539,6 +1536,7 @@ def review_preview(
     review_viewport,
 ):
     triggered = ctx.triggered_id
+    current_figure = bool(qc_cache)
 
     triggered_prop = (
         ctx.triggered[
@@ -1655,6 +1653,10 @@ def review_preview(
         revision = (qc_cache or {}).get("review_revision", "legacy-review")
         figure.update_xaxes(uirevision=revision)
         figure.update_yaxes(uirevision=revision)
+        figure.update_layout(meta={"blr_revision": revision})
+        # Browser already holds the RGB: never send it again in the response.
+        for image in figure.layout.images:
+            image.source = "__BLR_RGB__"
         figure = _restore_review_view(figure, review_viewport, revision)
 
         summary = (
@@ -1681,53 +1683,16 @@ def review_preview(
             summary,
         )
 
-    def figure_for_add_mode(
-        figure,
-        active,
-    ):
-        updated = _restore_review_view(
-            figure or {}, review_viewport,
-            (qc_cache or {}).get("review_revision", "legacy-review"),
-        )
-
-        layout = dict(
-            updated.get(
-                "layout",
-                {}
-            )
-        )
-
-        layout[
-            "dragmode"
-        ] = (
-            "drawrect"
-            if active
-            else "zoom"
-        )
-
-        layout[
-            "shapes"
-        ] = []
-
+    def figure_for_add_mode(figure, active):
+        # Patch only the drawing tools, without posting the full graph back.
+        updated = Patch()
+        updated["layout"]["dragmode"] = "drawrect" if active else "zoom"
+        updated["layout"]["shapes"] = []
         if active:
-            layout[
-                "newshape"
-            ] = {
-                "line":
-                    {
-                        "color":
-                            "#0d6efd",
-                        "width":
-                            2,
-                    },
-                "fillcolor":
-                    "rgba(13,110,253,0.08)",
+            updated["layout"]["newshape"] = {
+                "line": {"color": "#0d6efd", "width": 2},
+                "fillcolor": "rgba(13,110,253,0.08)",
             }
-
-        updated[
-            "layout"
-        ] = layout
-
         return updated
 
     def extract_rectangle(
@@ -1997,7 +1962,7 @@ def review_preview(
 
     if (
         triggered_prop
-        == "preview-graph.relayoutData"
+        == "review-drawing-store.data"
         and add_object_mode
     ):
         rectangle = (
@@ -2264,231 +2229,6 @@ def review_preview(
                     style={"color": "#dc3545"},
                 ),
             )
-
-    # -----------------------------------------------------
-    # Object click review
-    # -----------------------------------------------------
-
-    if (
-        triggered_prop
-        == "preview-graph.clickData"
-    ):
-        if (
-            add_object_mode
-            or not click_data
-        ):
-            return (
-                is_open,
-                no_update,
-                no_update,
-                no_update,
-                manual_accepted_labels,
-                manual_excluded_labels,
-                no_update,
-                manual_objects,
-                add_object_mode,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-            )
-
-        points = click_data.get(
-            "points",
-            []
-        )
-
-        if not points:
-            return (
-                is_open,
-                no_update,
-                no_update,
-                no_update,
-                manual_accepted_labels,
-                manual_excluded_labels,
-                no_update,
-                manual_objects,
-                False,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-            )
-
-        customdata = points[
-            0
-        ].get(
-            "customdata"
-        )
-
-        if (
-            not isinstance(
-                customdata,
-                (
-                    list,
-                    tuple,
-                ),
-            )
-            or len(
-                customdata
-            ) < 3
-        ):
-            return (
-                is_open,
-                no_update,
-                no_update,
-                no_update,
-                manual_accepted_labels,
-                manual_excluded_labels,
-                no_update,
-                manual_objects,
-                False,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-                no_update,
-            )
-
-        state = str(
-            customdata[
-                0
-            ]
-        )
-
-        object_identifier = int(
-            customdata[
-                1
-            ]
-        )
-
-        visible_number = int(
-            customdata[
-                2
-            ]
-        )
-
-        selected = {
-            "state":
-                state,
-            "label":
-                object_identifier,
-            "visible_number":
-                visible_number,
-        }
-
-        if len(customdata) >= 7:
-            selected["bbox"] = {
-                "x": int(customdata[3]),
-                "y": int(customdata[4]),
-                "width": int(customdata[5]),
-                "height": int(customdata[6]),
-            }
-        if len(customdata) >= 8 and customdata[7]:
-            selected["repair_type"] = str(customdata[7])
-        if len(customdata) >= 9 and customdata[8] != "":
-            selected["source_label"] = int(customdata[8])
-        if len(customdata) >= 10 and customdata[9]:
-            selected["source_state"] = str(customdata[9])
-
-        if state == "yellow":
-            return (
-                is_open,
-                no_update,
-                no_update,
-                no_update,
-                manual_accepted_labels,
-                manual_excluded_labels,
-                selected,
-                manual_objects,
-                False,
-                False,
-                "Accept",
-                "success",
-                visible_button_style,
-                "Add Object",
-                "primary",
-                html.Span(
-                    [
-                        "Selected ",
-                        html.Strong(
-                            f"S{visible_number}"
-                        ),
-                        " · yellow → green",
-                    ]
-                ),
-            )
-
-        if state == "manual":
-            return (
-                is_open,
-                no_update,
-                no_update,
-                no_update,
-                manual_accepted_labels,
-                manual_excluded_labels,
-                selected,
-                manual_objects,
-                False,
-                False,
-                "Remove",
-                "danger",
-                visible_button_style,
-                "Add Object",
-                "primary",
-                html.Span(
-                    [
-                        (
-                            "Selected refined object "
-                            if selected.get("repair_type") == "refined"
-                            else "Selected added object "
-                        ),
-                        html.Strong(
-                            str(
-                                visible_number
-                            )
-                        ),
-                        " · remove repair",
-                    ]
-                ),
-            )
-
-        return (
-            is_open,
-            no_update,
-            no_update,
-            no_update,
-            manual_accepted_labels,
-            manual_excluded_labels,
-            selected,
-            manual_objects,
-            False,
-            False,
-            "Exclude",
-            "warning",
-            visible_button_style,
-            "Add Object",
-            "primary",
-            html.Span(
-                [
-                    "Selected green object ",
-                    html.Strong(
-                        str(
-                            visible_number
-                        )
-                    ),
-                    " · green → yellow",
-                ]
-            ),
-        )
 
     # -----------------------------------------------------
     # Accept / Exclude / Remove
@@ -2784,19 +2524,16 @@ def review_preview(
 # Refine Object controls
 # ---------------------------------------------------------
 
-@app.callback(
+app.clientside_callback(
+    ClientsideFunction(namespace="blr_fast", function_name="refineButton"),
     Output("refine-object-button", "disabled"),
     Output("refine-object-button", "style"),
     Input("selected-object-store", "data"),
     Input("add-object-mode-store", "data"),
 )
-def toggle_refine_button(selected_object, add_object_mode):
-    if add_object_mode or not selected_object or not selected_object.get("bbox"):
-        return True, {"display": "none"}
-    return False, {"display": "inline-block"}
 
-
-@app.callback(
+app.clientside_callback(
+    ClientsideFunction(namespace="blr_fast", function_name="refineModal"),
     Output("refine-modal", "is_open"),
     Output("refine-target-store", "data"),
     Input("refine-object-button", "n_clicks"),
@@ -2806,69 +2543,38 @@ def toggle_refine_button(selected_object, add_object_mode):
     State("refine-modal", "is_open"),
     prevent_initial_call=True,
 )
-def toggle_refine_modal(open_clicks, cancel_clicks, apply_clicks, selected_object, is_open):
-    triggered = ctx.triggered_id
 
-    if triggered == "refine-object-button":
-        if selected_object and selected_object.get("bbox"):
-            return True, selected_object
-        return False, None
-
-    if triggered == "refine-cancel-button":
-        return False, None
-
-    if triggered == "refine-apply-button":
-        # Keep the target available for the review callback handling Apply.
-        return False, no_update
-
-    return is_open, no_update
-
-
-@app.callback(
-    Output("refine-threshold-slider", "value"),
-    Output("refine-margin-slider", "value"),
-    Output("refine-control-status", "children"),
+app.clientside_callback(
+    ClientsideFunction(namespace="blr_fast", function_name="refineControls"),
+    Output("refine-threshold-slider", "value", allow_duplicate=True),
+    Output("refine-margin-slider", "value", allow_duplicate=True),
+    Output("refine-control-status", "children", allow_duplicate=True),
     Input("refine-target-store", "data"),
-    Input("refine-auto-button", "n_clicks"),
     Input("refine-reset-button", "n_clicks"),
-    State("upload-image", "contents"),
-    State("refine-margin-slider", "value"),
     State("qc-cache-store", "data"),
     prevent_initial_call=True,
 )
-def update_refine_controls(target, auto_clicks, reset_clicks, image_contents, current_margin, qc_cache):
-    triggered = ctx.triggered_id
-    baseline = (qc_cache or {}).get("manual_brightness_threshold")
-    baseline = int(baseline) if baseline is not None else 10
 
-    if triggered == "refine-target-store":
-        if target:
-            return baseline, 6, f"Batch baseline: brightness threshold {baseline}."
-        return no_update, no_update, ""
-
-    if triggered == "refine-reset-button":
-        return baseline, 6, f"Reset to threshold {baseline} and selection margin 6 px."
-
-    if triggered == "refine-auto-button":
-        if not target or not target.get("bbox") or not image_contents:
-            return no_update, no_update, "Select an object first."
-        try:
-            margin = int(current_margin if current_margin is not None else 6)
-            suggested = suggest_refine_threshold(
-                image_contents=image_contents,
-                bbox=target["bbox"],
-                margin=margin,
-            )
-            return (
-                suggested,
-                margin,
-                f"Auto suggested threshold {suggested} for this local selection.",
-            )
-        except Exception as e:
-            return no_update, no_update, f"Auto threshold error: {e}"
-
-    return no_update, no_update, no_update
-
+@app.callback(
+    Output("refine-threshold-slider", "value", allow_duplicate=True),
+    Output("refine-margin-slider", "value", allow_duplicate=True),
+    Output("refine-control-status", "children", allow_duplicate=True),
+    Input("refine-auto-button", "n_clicks"),
+    State("refine-target-store", "data"),
+    State("upload-image", "contents"),
+    State("refine-margin-slider", "value"),
+    prevent_initial_call=True,
+)
+def suggest_local_refine(auto_clicks, target, image_contents, current_margin):
+    if not target or not target.get("bbox") or not image_contents:
+        return no_update, no_update, "Select an object first."
+    try:
+        margin = int(current_margin if current_margin is not None else 6)
+        suggested = suggest_refine_threshold(image_contents=image_contents,
+                                             bbox=target["bbox"], margin=margin)
+        return suggested, margin, f"Auto suggested threshold {suggested} for this local selection."
+    except Exception as e:
+        return no_update, no_update, f"Auto threshold error: {e}"
 
 @app.callback(
     Output("refine-preview-graph", "figure"),
