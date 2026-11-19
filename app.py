@@ -19,7 +19,6 @@ import dash_bootstrap_components as dbc
 from utils.metadata_reader import read_metadata
 from utils.geometry_qc import (
     build_geometry_qc_preview,
-    build_selected_download_preview,
     build_refine_preview,
     create_manual_object_spec,
     create_refined_object_spec,
@@ -786,7 +785,6 @@ app.layout = html.Div(
                                                 "columnGap": "16px", "rowGap": "16px",
                                             },
                                         ),
-                                        html.Div(id="selected-download-preview"),
                                     ],
                                 )
                             ],
@@ -3319,35 +3317,6 @@ def generate_dataset(
                     "danger",
             ),
         )
-
-
-@app.callback(
-    Output("selected-download-preview", "children"),
-    Input("selected-object-store", "data"),
-    Input("manual-objects-store", "data"),
-    Input("qc-cache-store", "data"),
-    Input("output-width-input", "value"),
-    Input("output-height-input", "value"),
-    State("upload-image", "contents"),
-    prevent_initial_call=True,
-)
-def update_selected_download_preview(selected, manual_objects, qc_cache,
-                                     width, height, image_contents):
-    if not selected or not image_contents:
-        return []
-    try:
-        source, note = build_selected_download_preview(
-            image_contents, selected, qc_cache, manual_objects,
-            width or 320, height or 320)
-        children = [html.Div([html.Strong("Download preview"),
-                             html.Div(note, className="text-muted small")])]
-        if source:
-            children.insert(0, html.Img(src=source, alt="Selected object download preview",
-                                       style={"width": "160px", "maxWidth": "100%", "height": "auto"}))
-        return html.Div(children, className="border-top p-3 d-flex align-items-center flex-wrap gap-3")
-    except Exception:
-        return html.Div("Preview unavailable. Select the object again or run Analyze Batch.",
-                        className="text-muted p-3")
 
 
 # ---------------------------------------------------------
